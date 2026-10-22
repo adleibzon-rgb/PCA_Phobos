@@ -73,19 +73,24 @@
 
 ---
 
+> **Источник с 23.10.2026:** `git.bobyrev.com/PCA/PCA_Phobos` (GitHub-аккаунт временно недоступен). Серверы на 1.2.x обновляются одной командой:
+> ```bash
+> bash <(curl -fsSL https://git.bobyrev.com/PCA/PCA_Phobos/raw/branch/main/update.sh)
+> ```
+
 ## Быстрый старт (с чистого VPS, одной командой)
 
 Ставит **всё** со всеми зависимостями: wg-obfuscator, WireGuard, обфускатор-сервисы, веб-панель, nginx, скрипты онбординга роутеров, сторож авто-восстановления. Предустановленный Phobos **не требуется**.
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/andrey271192/PCA_Phobos/main/install.sh)
+bash <(curl -fsSL https://git.bobyrev.com/PCA/PCA_Phobos/raw/branch/main/install.sh)
 ```
 
 ### С параметрами
 
 ```bash
 PANEL_PASS=МойПароль TG_TOKEN=123:abc TG_CHAT=123456789 \
-bash <(curl -fsSL https://raw.githubusercontent.com/andrey271192/PCA_Phobos/main/install.sh)
+bash <(curl -fsSL https://git.bobyrev.com/PCA/PCA_Phobos/raw/branch/main/install.sh)
 ```
 
 | Переменная        | По умолчанию    | Описание |
@@ -106,7 +111,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/andrey271192/PCA_Phobos/main
 
 ```bash
 MAIN_PROTO=http MAIN_SERVER=<ip_основного> MAIN_PORT=<порт_панели> MAIN_API_KEY=<API key из основного> \
-bash <(curl -fsSL https://raw.githubusercontent.com/andrey271192/PCA_Phobos/main/server/secondary-setup.sh)
+bash <(curl -fsSL https://git.bobyrev.com/PCA/PCA_Phobos/raw/branch/main/server/secondary-setup.sh)
 ```
 
 Сервер сам зарегистрируется в панели, клиенты досылаются на него сразу. Если сервер за NAT — добавь `SERVER_IP=<внешний_ip>`.
@@ -116,7 +121,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/andrey271192/PCA_Phobos/main
 На входном VPS (чистый Debian/Ubuntu, Phobos не нужен):
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/andrey271192/PCA_Phobos/main/server/phobos-cascade.sh) enable <IP_выходного_сервера> 2083,5443,993
+bash <(curl -fsSL https://git.bobyrev.com/PCA/PCA_Phobos/raw/branch/main/server/phobos-cascade.sh) enable <IP_выходного_сервера> 2083,5443,993
 ```
 
 Затем в панели выходного сервера → **Настройки → Адрес для клиентов и каскад** → впиши IP/домен входа. Роутеры переключатся сами (~15 с), телефонам — заново открыть ссылку/QR. Отключить: `phobos-cascade disable`.
@@ -131,8 +136,8 @@ bash <(curl -fsSL https://raw.githubusercontent.com/andrey271192/PCA_Phobos/main
 
 ## Приложения для Android
 
-- **PCA Phobos VPN** — клиент: включает VPN одной кнопкой, импорт `phobos://` из панели, встроенный обфускатор, **раздельный трафик** (весь / только выбранные приложения / все кроме выбранных), журнал, проверка скорости. [Скачать APK](https://github.com/andrey271192/PCA_Phobos/releases/latest/download/PCA-Phobos-VPN.apk) · исходники `android-client/`.
-- **PCA Phobos** (админ) — список ваших панелей, открываются в приложении. [Скачать APK](https://github.com/andrey271192/PCA_Phobos/releases/latest/download/PCA-Phobos.apk) · исходники `android/`.
+- **PCA Phobos VPN** — клиент: включает VPN одной кнопкой, импорт `phobos://` из панели, встроенный обфускатор, **раздельный трафик** (весь / только выбранные приложения / все кроме выбранных), журнал, проверка скорости. [Скачать APK](https://git.bobyrev.com/PCA/PCA_Phobos/releases/download/v1.4.0/PCA-Phobos-VPN.apk) · исходники `android-client/`.
+- **PCA Phobos** (админ) — список ваших панелей, открываются в приложении. [Скачать APK](https://git.bobyrev.com/PCA/PCA_Phobos/releases/download/v1.4.0/PCA-Phobos.apk) · исходники `android/`.
 
 ## Клиенты для телефона
 

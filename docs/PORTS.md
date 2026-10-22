@@ -71,7 +71,7 @@ Native HTTPS is supported by the primary installer:
 ```bash
 PANEL_TLS_CERT=/etc/letsencrypt/live/example.com/fullchain.pem \
 PANEL_TLS_KEY=/etc/letsencrypt/live/example.com/privkey.pem \
-bash <(curl -fsSL https://raw.githubusercontent.com/andrey271192/PCA_Phobos/main/install.sh)
+bash <(curl -fsSL https://git.bobyrev.com/PCA/PCA_Phobos/raw/branch/main/install.sh)
 ```
 
 Then the panel runs as:

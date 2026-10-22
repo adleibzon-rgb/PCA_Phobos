@@ -3,7 +3,7 @@
 #  PCA Phobos — TURNKEY installer (primary / panel node)
 #
 #  One command, all dependencies, from a clean VPS:
-#    bash <(curl -fsSL https://raw.githubusercontent.com/andrey271192/PCA_Phobos/main/install.sh)
+#    bash <(curl -fsSL https://git.bobyrev.com/PCA/PCA_Phobos/raw/branch/main/install.sh)
 #
 #  Installs, in order:
 #    deps -> wg-obfuscator (Ground-Zerro) -> WireGuard wg0 ->
@@ -30,33 +30,19 @@ TG_TOKEN="${TG_TOKEN:-}"
 TG_CHAT="${TG_CHAT:-}"
 OBF_PORTS="${OBF_PORTS:-2083,5443,993}"
 SERVER_WG_IPV4_NETWORK="${SERVER_WG_IPV4_NETWORK:-10.25.0.0/16}"
-# Каналы: stable (открытый, публичный repo) · beta (тест) · dev (разработка).
-# beta и dev живут в ПРИВАТНОМ repo PCA_Phobos-dev — доступ по токену подписчика
-# (GH_TOKEN, read-only, выдаётся по подписке Boosty). stable — без токена.
-GH_TOKEN="${GH_TOKEN:-}"
-PUB_REPO="andrey271192/PCA_Phobos"
-DEV_REPO="andrey271192/PCA_Phobos-dev"
-PHOBOSWG_APK_TAG="v1.3.0-beta"
-PHOBOSWG_APK_SHA256="5399de7c576d56e491a01ab9b52d53c08d30a34d1156c1cb0f4520bf34821e02"
+# Источник: Gitea git.bobyrev.com (основной), GitHub — запасной.
+# Каналы stable/beta/dev — ветки main/beta/dev одного публичного репозитория.
+PCA_GIT="${PCA_GIT:-https://git.bobyrev.com/PCA/PCA_Phobos}"
+GH_RAW="${GH_RAW:-https://raw.githubusercontent.com/andrey271192/PCA_Phobos}"
 CHANNEL="${CHANNEL:-stable}"
 case "$CHANNEL" in
-  beta) REPO="$DEV_REPO"; PCA_BRANCH="${PCA_BRANCH:-beta}";;
-  dev)  REPO="$DEV_REPO"; PCA_BRANCH="${PCA_BRANCH:-dev}";;
-  stable|main|"") REPO="$PUB_REPO"; PCA_BRANCH="${PCA_BRANCH:-main}";;
-  *)    REPO="$PUB_REPO"; PCA_BRANCH="${PCA_BRANCH:-$CHANNEL}";;
+  stable|main|"") PCA_BRANCH="${PCA_BRANCH:-main}";;
+  *)              PCA_BRANCH="${PCA_BRANCH:-$CHANNEL}";;
 esac
-if [ "$REPO" = "$DEV_REPO" ] && [ -z "$GH_TOKEN" ]; then
-    echo "Канал '$CHANNEL' закрыт — это $([ "$CHANNEL" = dev ] && echo 'разработка (нестабильно)' || echo 'бета (тест)'), приватный репозиторий."
-    echo "Нужен read-only токен подписчика:"
-    echo "  GH_TOKEN=ваш_токен CHANNEL=$CHANNEL bash <(curl -fsSL https://raw.githubusercontent.com/$PUB_REPO/main/install.sh)"
-    echo "Токен выдаётся по подписке: https://boosty.to/andrey27"
-    echo "Стабильная версия ставится без токена (CHANNEL=stable, по умолчанию)."
-    exit 1
-fi
-[ "$REPO" = "$DEV_REPO" ] && echo "Токен принят — закрытый канал '$CHANNEL' (приватный repo)."
+case "$PCA_BRANCH" in v[0-9]*) _kind=tag;; *) _kind=branch;; esac
 PHOBOS_DIR="/opt/Phobos"
 PANEL_DIR="/opt/phobos-panel"
-RAW="https://raw.githubusercontent.com/${REPO}/${PCA_BRANCH}"
+RAW="$PCA_GIT/raw/$_kind/$PCA_BRANCH"
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 [ "$EUID" -eq 0 ] || { echo "Run as root"; exit 1; }
@@ -235,12 +221,8 @@ fetch() {
     mkdir -p "$(dirname "$2")"
     # ponytail: файл из архива рядом с install.sh — не ходим в сеть.
     if [ -f "$SRC/$1" ]; then cp -f "$SRC/$1" "$2" && return 0; fi
-    _url="$RAW/$1?cb=$(date +%s)"
-    if [ -n "$GH_TOKEN" ]; then
-        curl -fsSL -m20 -H "Authorization: token $GH_TOKEN" "$_url" -o "$2" && return 0
-    else
-        curl -fsSL -m20 "$_url" -o "$2" && return 0
-    fi
+    curl -fsSL -m20 "$RAW/$1?cb=$(date +%s)" -o "$2" && return 0
+    curl -fsSL -m20 "$GH_RAW/$PCA_BRANCH/$1?cb=$(date +%s)" -o "$2" && return 0
     echo "  WARN: fetch $1 failed"; return 1
 }
 fetch overlay/lib-core.sh                      "$PHOBOS_DIR/repo/server/scripts/lib-core.sh"             && chmod +x "$PHOBOS_DIR/repo/server/scripts/lib-core.sh"
@@ -345,39 +327,9 @@ fi
 
 sleep 2
 
-# ── PhobosWG APK (beta/dev only: fetch from private release asset) ──
-if [ "$REPO" = "$DEV_REPO" ] && [ -n "$GH_TOKEN" ]; then
-  mkdir -p "$PHOBOS_DIR/www/app"
-  _apk="$PHOBOS_DIR/www/app/PhobosWG.apk"
-  _cur_sha="$(sha256sum "$_apk" 2>/dev/null | awk '{print $1}')"
-  if [ "$_cur_sha" != "$PHOBOSWG_APK_SHA256" ]; then
-    echo "[APK] Refreshing PhobosWG.apk from release $PHOBOSWG_APK_TAG..."
-    _apk_api_url=$(curl -fsSL -m15 -H "Authorization: token $GH_TOKEN" \
-      "https://api.github.com/repos/$DEV_REPO/releases/tags/$PHOBOSWG_APK_TAG" 2>/dev/null \
-      | grep -B8 '"name": "PhobosWG.apk"' | grep '"url"' | head -1 | cut -d'"' -f4)
-    if [ -n "$_apk_api_url" ] && curl -fsSL -m120 -H "Authorization: token $GH_TOKEN" \
-      -H "Accept: application/octet-stream" "$_apk_api_url" -o "$_apk"; then
-      _new_sha="$(sha256sum "$_apk" 2>/dev/null | awk '{print $1}')"
-      if [ "$_new_sha" = "$PHOBOSWG_APK_SHA256" ]; then
-        echo "[APK] Downloaded PhobosWG.apk: $(ls -lh "$_apk" | awk '{print $5}')"
-      else
-        rm -f "$_apk"
-        echo "[APK] SHA mismatch after download (non-fatal)"
-      fi
-    else
-      echo "[APK] Download failed (non-fatal)"
-    fi
-  else
-    echo "[APK] PhobosWG.apk current"
-  fi
-fi
-
-# persist channel + subscriber token so phobos-update can reach private channels
+# persist channel so phobos-update follows it
 mkdir -p "$PANEL_DIR"
 echo "$CHANNEL" > "$PANEL_DIR/.channel" 2>/dev/null || true
-if [ "$REPO" = "$DEV_REPO" ] && [ -n "$GH_TOKEN" ]; then
-    ( umask 077; printf %s "$GH_TOKEN" > "$PANEL_DIR/.gh_token" )
-fi
 
 echo ""
 echo "============================================"

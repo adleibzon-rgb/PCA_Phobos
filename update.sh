@@ -3,19 +3,14 @@
 #  PCA Phobos — updater / rollback
 #
 #    phobos-update                 # обновить до стабильной (канал stable / main)
-#    phobos-update stable          # стабильный канал (публичный, без токена)
-#    GH_TOKEN=... phobos-update beta   # бета-канал (приватный, по токену подписчика)
-#    GH_TOKEN=... phobos-update dev    # канал разработки (приватный, по токену)
+#    phobos-update stable|beta|dev # канал (ветка main/beta/dev)
 #    phobos-update v1.2.4          # конкретная версия (git tag)
 #    phobos-update --rollback      # откатить на предыдущую версию (из бэкапа)
 #    phobos-update --check         # установленная + версии всех каналов
 #    phobos-update --list          # список бэкапов для отката
 #
-#  Каналы:
-#    stable -> публичный репозиторий andrey271192/PCA_Phobos  (открыт)
-#    beta / dev -> приватный andrey271192/PCA_Phobos-dev      (только подписчики)
-#  Для beta/dev нужен read-only токен подписчика: env GH_TOKEN или файл
-#  $PANEL_DIR/.gh_token (сохраняется при установке закрытого канала).
+#  Источник: Gitea git.bobyrev.com/PCA/PCA_Phobos (основной), GitHub — запасной.
+#  Свой адрес: PCA_GIT=https://… phobos-update
 #
 #  Обновляет ТОЛЬКО PCA-слой (панель + скрипты). НЕ трогает ключи WireGuard,
 #  server.env, клиентов. Перед каждым обновлением — бэкап; откат восстанавливает.
@@ -23,10 +18,8 @@
 set -e
 PHOBOS_DIR=/opt/Phobos
 PANEL_DIR=/opt/phobos-panel
-PUB_REPO=andrey271192/PCA_Phobos
-DEV_REPO=andrey271192/PCA_Phobos-dev
-PHOBOSWG_APK_TAG="v1.3.0-beta"
-PHOBOSWG_APK_SHA256="5399de7c576d56e491a01ab9b52d53c08d30a34d1156c1cb0f4520bf34821e02"
+PCA_GIT="${PCA_GIT:-https://git.bobyrev.com/PCA/PCA_Phobos}"
+GH_RAW="${GH_RAW:-https://raw.githubusercontent.com/andrey271192/PCA_Phobos}"
 BACKUPS="$PHOBOS_DIR/updates"
 VERFILE="$PANEL_DIR/.version"
 CUR=$(cat "$VERFILE" 2>/dev/null || echo "unknown")
@@ -46,30 +39,14 @@ restart_panel_service() {
     systemctl restart "$svc" 2>/dev/null || true
 }
 
-# repo for a ref/channel: beta/dev/*-beta/*-dev -> private, остальное -> public
-repo_for() { case "$1" in beta|dev|*-beta|*-dev) echo "$DEV_REPO";; *) echo "$PUB_REPO";; esac; }
-is_private() { case "$1" in beta|dev|*-beta|*-dev) return 0;; *) return 1;; esac; }
-# curl with token header only when ref is a private channel
-gh_curl() {  # $1=ref, rest=curl args
-    local ref="$1"; shift
-    if is_private "$ref" && [ -n "$GH_TOKEN" ]; then
-        curl -H "Authorization: token $GH_TOKEN" "$@"
-    else
-        curl "$@"
-    fi
-}
+# since 1.4.0 all channels are branches of one public repo (no subscriber token)
+is_private() { return 1; }
 
-fetch_repo_file() {  # $1=ref $2=repo_path $3=output
-    local ref="$1" rp="$2" out="$3" repo
-    repo=$(repo_for "$ref")
-    if is_private "$ref" && [ -n "$GH_TOKEN" ]; then
-        curl -fsSL -m25 -H "Authorization: token $GH_TOKEN" \
-            -H "Accept: application/vnd.github.raw" \
-            "https://api.github.com/repos/$repo/contents/$rp?ref=$ref" -o "$out"
-    else
-        gh_curl "$ref" -fsSL -m25 \
-            "https://raw.githubusercontent.com/$repo/$ref/$rp?cb=$(date +%s)" -o "$out"
-    fi
+fetch_repo_file() {  # $1=ref $2=repo_path $3=output ; Gitea first, GitHub fallback
+    local ref="$1" rp="$2" out="$3" kind=branch
+    case "$ref" in v[0-9]*) kind=tag;; esac
+    curl -fsSL -m25 "$PCA_GIT/raw/$kind/$ref/$rp?cb=$(date +%s)" -o "$out" 2>/dev/null && return 0
+    curl -fsSL -m25 "$GH_RAW/$ref/$rp?cb=$(date +%s)" -o "$out"
 }
 
 fetch_repo_text() {  # $1=ref $2=repo_path
@@ -79,38 +56,6 @@ fetch_repo_text() {  # $1=ref $2=repo_path
     if [ "$rc" = 0 ]; then cat "$tmp"; fi
     rm -f "$tmp"
     return "$rc"
-}
-
-refresh_phoboswg_apk() {  # $1=ref/channel
-    local ref="${1:-}"
-    is_private "$ref" || return 0
-    [ -n "$GH_TOKEN" ] || return 0
-    local apk="$PHOBOS_DIR/www/app/PhobosWG.apk"
-    mkdir -p "$PHOBOS_DIR/www/app"
-    local cur_sha
-    cur_sha="$(sha256sum "$apk" 2>/dev/null | awk '{print $1}')"
-    if [ "$cur_sha" = "$PHOBOSWG_APK_SHA256" ]; then
-        echo "[APK] PhobosWG.apk current"
-        return 0
-    fi
-    echo "[APK] Refreshing PhobosWG.apk from release $PHOBOSWG_APK_TAG..."
-    local apk_api_url
-    apk_api_url="$(curl -fsSL -m15 -H "Authorization: token $GH_TOKEN" \
-        "https://api.github.com/repos/$DEV_REPO/releases/tags/$PHOBOSWG_APK_TAG" 2>/dev/null \
-        | grep -B8 '"name": "PhobosWG.apk"' | grep '"url"' | head -1 | cut -d'"' -f4)"
-    if [ -n "$apk_api_url" ] && curl -fsSL -m120 -H "Authorization: token $GH_TOKEN" \
-        -H "Accept: application/octet-stream" "$apk_api_url" -o "$apk"; then
-        local new_sha
-        new_sha="$(sha256sum "$apk" 2>/dev/null | awk '{print $1}')"
-        if [ "$new_sha" = "$PHOBOSWG_APK_SHA256" ]; then
-            echo "[APK] Downloaded PhobosWG.apk: $(ls -lh "$apk" | awk '{print $5}')"
-        else
-            rm -f "$apk"
-            echo "[APK] SHA mismatch after download (non-fatal)"
-        fi
-    else
-        echo "[APK] Download failed (non-fatal)"
-    fi
 }
 
 managed_files() {
@@ -180,7 +125,7 @@ chan_version() {  # $1 = ref(channel)
     if is_private "$1" && [ -z "$GH_TOKEN" ]; then echo ""; return; fi
     fetch_repo_text "$1" VERSION 2>/dev/null | tr -d ' \r\n'
 }
-latest_version() { curl -fsSL -m10 "https://raw.githubusercontent.com/$PUB_REPO/main/VERSION" 2>/dev/null | tr -d ' \r\n'; }
+latest_version() { fetch_repo_text main VERSION 2>/dev/null | tr -d ' \r\n'; }
 
 do_backup() {
     local dir="$BACKUPS/${CUR}-$(date +%Y%m%d-%H%M%S)"
@@ -244,24 +189,13 @@ case "${1:-}" in
   --version|-v|--check)
     echo "Установлено:    $CUR"
     echo "Стабильная:     $(latest_version)   [открытый]"
-    b=$(chan_version beta); d=$(chan_version dev)
-    if [ -n "$GH_TOKEN" ]; then
-        [ -n "$b" ] && echo "Бета (beta):    $b   [приватный, токен ок]"
-        [ -n "$d" ] && echo "Разработка(dev):$d   [приватный, токен ок]"
-    else
-        echo "Бета (beta):    —   [приватный: нужен GH_TOKEN подписчика]"
-        echo "Разработка(dev):—   [приватный: нужен GH_TOKEN подписчика]"
-    fi
+    echo "Бета (beta):    $(chan_version beta)"
+    echo "Разработка(dev):$(chan_version dev)"
     ;;
   --versions|--tags)
-    echo "Стабильные версии (публичные теги):"
-    curl -fsSL -m10 "https://api.github.com/repos/$PUB_REPO/tags?per_page=100" 2>/dev/null \
+    echo "Версии (теги):"
+    curl -fsSL -m10 "${PCA_GIT%/*/*}/api/v1/repos/${PCA_GIT#*://*/}/tags?limit=100" 2>/dev/null \
       | grep -oE '"name": *"[^"]+"' | sed 's/.*"name": *"\(.*\)"/  \1/' || echo "  (нет данных)"
-    if [ -n "$GH_TOKEN" ]; then
-        echo "Закрытые версии (приватные теги, beta/dev):"
-        curl -fsSL -m10 -H "Authorization: token $GH_TOKEN" "https://api.github.com/repos/$DEV_REPO/tags?per_page=100" 2>/dev/null \
-          | grep -oE '"name": *"[^"]+"' | sed 's/.*"name": *"\(.*\)"/  \1/' || echo "  (нет данных)"
-    fi
     ;;
   --list)
     echo "Бэкапы (для отката):"
@@ -316,7 +250,6 @@ case "${1:-}" in
     b=$(do_backup); echo "Бэкап: $b"
     apply_ref "$ref"
     ensure_runtime_deps
-    refresh_phoboswg_apk "$ref"
     run_self_check
     refresh_router_packages
     echo "$target" > "$VERFILE"

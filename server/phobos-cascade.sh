@@ -8,7 +8,7 @@
 set -uo pipefail
 STATE=/etc/phobos-cascade.env
 BIN=/usr/local/sbin/phobos-cascade
-SELF_URL="${SELF_URL:-https://raw.githubusercontent.com/andrey271192/PCA_Phobos/main/server/phobos-cascade.sh}"
+SELF_URL="${SELF_URL:-https://git.bobyrev.com/PCA/PCA_Phobos/raw/branch/main/server/phobos-cascade.sh}"
 TAG="phobos-cascade"
 
 clear_rules() {

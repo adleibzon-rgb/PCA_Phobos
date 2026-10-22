@@ -289,16 +289,11 @@ EOF
 echo "[6/7] Setting up mini-API..."
 # Mini-API (fetched from the main panel first, then PCA GitHub fallback)
 PCA_BRANCH="${PCA_BRANCH:-main}"
-PCA_REPO="${PCA_REPO:-andrey271192/PCA_Phobos}"
-RAW="${PCA_RAW_BASE:-https://raw.githubusercontent.com/${PCA_REPO}/${PCA_BRANCH}}"
+RAW="${PCA_RAW_BASE:-https://git.bobyrev.com/PCA/PCA_Phobos/raw/branch/${PCA_BRANCH}}"
 PANEL_BOOTSTRAP="${MAIN_PROTO}://${MAIN_SERVER}:${MAIN_PORT}/server/api.py"
-if ! curl -kfsSL "$PANEL_BOOTSTRAP" -o "$PHOBOS_DIR/server/api.py"; then
-    if [ -n "${GH_TOKEN:-}" ]; then
-        curl -fsSL -H "Authorization: token $GH_TOKEN" "$RAW/server/api.py" -o "$PHOBOS_DIR/server/api.py"
-    else
-        curl -fsSL "$RAW/server/api.py" -o "$PHOBOS_DIR/server/api.py"
-    fi
-fi
+curl -kfsSL "$PANEL_BOOTSTRAP" -o "$PHOBOS_DIR/server/api.py" \
+    || curl -fsSL "$RAW/server/api.py" -o "$PHOBOS_DIR/server/api.py" \
+    || curl -fsSL "https://raw.githubusercontent.com/andrey271192/PCA_Phobos/${PCA_BRANCH}/server/api.py" -o "$PHOBOS_DIR/server/api.py"
 [ -s "$PHOBOS_DIR/server/api.py" ] || { echo "ERROR: api.py fetch failed"; exit 1; }
 
 cat > /etc/systemd/system/phobos-api.service << EOF

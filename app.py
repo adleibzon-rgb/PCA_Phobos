@@ -34,6 +34,10 @@ PANEL_DIR = "/opt/phobos-panel"
 SETTINGS_FILE = f"{PANEL_DIR}/settings.json"
 SECRET_FILE = f"{PANEL_DIR}/.secret_key"
 WG_CONFIG = "/etc/wireguard/wg0.conf"
+# Distribution: Gitea first (GitHub account is unavailable since 23.10.2026), GitHub fallback
+PCA_GIT = "https://git.bobyrev.com/PCA/PCA_Phobos"
+PCA_GH_RAW = "https://raw.githubusercontent.com/andrey271192/PCA_Phobos"
+APK_TAG = "v1.4.0"
 WARP_DIR = f"{PHOBOS_DIR}/server/warp"
 WARP_CUSTOM_PROFILE_FILE = f"{WARP_DIR}/custom-profile.conf"
 WARP_LICENSE_FILE = f"{WARP_DIR}/license.key"
@@ -1058,26 +1062,17 @@ def _find_update_runner():
 
 
 def _restore_update_script(ref):
-    repo, branch = _update_repo_for_ref(ref)
-    token = ""
-    try:
-        token = Path(GH_TOKEN_FILE).read_text().strip()
-    except Exception:
-        pass
-    cmd = ["curl", "-fsSL", "-m", "25"]
-    if repo.endswith("-dev") and token:
-        cmd += ["-H", f"Authorization: token {token}"]
-        cmd += ["-H", "Accept: application/vnd.github.raw"]
-        url = f"https://api.github.com/repos/{repo}/contents/update.sh?ref={branch}"
-    else:
-        if token:
-            cmd += ["-H", f"Authorization: token {token}"]
-        url = f"https://raw.githubusercontent.com/{repo}/{branch}/update.sh?cb={int(time.time())}"
-    cmd.append(url)
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=35)
-    if r.returncode != 0 or not (r.stdout or "").startswith("#!"):
-        hint = "subscriber token missing or invalid" if repo.endswith("-dev") and not token else (r.stderr or "download failed")
-        return False, f"update helper restore failed from {repo}/{branch}: {hint}"
+    _repo, branch = _update_repo_for_ref(ref)
+    kind = "tag" if branch.startswith("v") else "branch"
+    r = None
+    for url in (f"{PCA_GIT}/raw/{kind}/{branch}/update.sh", f"{PCA_GH_RAW}/{branch}/update.sh"):
+        r = subprocess.run(["curl", "-fsSL", "-m", "25", f"{url}?cb={int(time.time())}"],
+                           capture_output=True, text=True, timeout=35)
+        if r.returncode == 0 and (r.stdout or "").startswith("#!"):
+            break
+    if r is None or r.returncode != 0 or not (r.stdout or "").startswith("#!"):
+        return False, f"update helper restore failed for {branch}: {(r.stderr if r else '') or 'download failed'}"
+    repo = PCA_GIT
     os.makedirs(os.path.dirname(UPDATE_SCRIPT), exist_ok=True)
     tmp = UPDATE_SCRIPT + ".tmp"
     Path(tmp).write_text(r.stdout)
@@ -1812,7 +1807,7 @@ textarea::placeholder{color:var(--muted)}
 </div>
 CONTENT
 <div class="footer">
-<b style="color:var(--accent)">PCA Phobos Panel</b> — панель управления &copy; <a href="https://github.com/andrey271192/PCA_Phobos" target="_blank" rel="noopener">andrey271192</a><br>
+<b style="color:var(--accent)">PCA Phobos Panel</b> — панель управления &copy; <a href="https://git.bobyrev.com/PCA/PCA_Phobos" target="_blank" rel="noopener">andrey271192</a><br>
 Поддержать проект: <a href="https://boosty.to/andrey27/donate" target="_blank" rel="noopener">💖 Boosty</a> · <a href="https://finance.ozon.ru/apps/sbp/ozonbankpay/019dc200-2a5d-7931-a619-782d285f6798" target="_blank" rel="noopener">💳 Ozon Bank</a> · <a href="https://t.me/PCAdministration" target="_blank" rel="noopener">✉️ Telegram</a>
 <div style="margin-top:8px;font-size:.88em;color:var(--muted);line-height:1.7;text-align:left;max-width:660px;margin:8px auto 0">
 <b>Создано на основе открытых проектов:</b><br>
@@ -2785,7 +2780,7 @@ def settings_page():
         f'<div class="form-row"><label>{_html_attr(sv["ip"])}{" ★" if sv.get("is_primary") else ""}</label>'
         f'<input type="text" name="ep_{_html_attr(sv["ip"])}" value="{_html_attr(eps.get(sv["ip"], ""))}" placeholder="{_html_attr(sv["ip"])}" style="width:260px"></div>'
         for sv in get_all_servers_ordered())
-    cascade_cmd = f"bash &lt;(curl -fsSL https://raw.githubusercontent.com/andrey271192/PCA_Phobos/main/server/phobos-cascade.sh) enable {SERVER_IP} {_load_server_env().get('OBFUSCATOR_PORTS', '2083,5443,993')}"
+    cascade_cmd = f"bash &lt;(curl -fsSL {PCA_GIT}/raw/branch/main/server/phobos-cascade.sh) enable {SERVER_IP} {_load_server_env().get('OBFUSCATOR_PORTS', '2083,5443,993')}"
     extras_html = f"""
     <div class="card">
     <h2>{tr("Домен панели","Panel domain")} {hlp("Панель по адресу https://ваш-домен/ с бесплатным сертификатом Let's Encrypt (nginx на 443). Домен (A-запись) должен указывать на IP этого сервера, порт 80 открыт. Старый адрес http://IP:порт продолжает работать — роутеры и второй сервер ничего не заметят.", "Panel at https://your-domain/ with a free Let's Encrypt certificate (nginx on 443). The domain A record must point to this server, port 80 open. The old http://IP:port keeps working — routers and secondaries notice nothing.")}</h2>
@@ -2847,7 +2842,7 @@ def settings_page():
       <b style="color:#22c55e">stable</b> — {tr("стабильная","stable")} ·
       <b style="color:#eab308">beta</b> — {tr("тест","testing")} ·
       <b style="color:#f97316">dev</b> — {tr("разработка","development")}.
-      {tr("stable — без токена. Для beta/dev вставь токен подписчика (по подписке Boosty), сохрани — и жми канал.","stable needs no token. For beta/dev paste your subscriber token (Boosty), save it, then click the channel.")}</p>
+      {tr("С 1.4.0 все каналы открыты и берутся с git.bobyrev.com (GitHub — запасной). Токен больше не нужен.","Since 1.4.0 all channels are open and served from git.bobyrev.com (GitHub as fallback). No token needed.")}</p>
     <form method="post" class="form-row" style="margin-bottom:8px">
       <input type="hidden" name="action" value="save_token">
       <input type="password" name="gh_token" placeholder="{tr('токен подписчика (для beta/dev)','subscriber token (for beta/dev)')}" style="width:240px" autocomplete="off">
@@ -3298,45 +3293,13 @@ def sync_missing_peers_to_secondaries(server=None):
 @app.route("/download/apk")
 @auth_required
 def download_apk():
-    """Proxy PhobosWG APK from GitHub release using saved subscriber token."""
+    """PhobosWG APK: local copy if the server has one, else the release on Gitea."""
     local = "/opt/Phobos/www/app/PhobosWG.apk"
     if os.path.exists(local):
         from flask import send_file
         return send_file(local, as_attachment=True, download_name="PhobosWG.apk",
                          mimetype="application/vnd.android.package-archive")
-    try:
-        gh_token = open("/opt/phobos-panel/.gh_token").read().strip()
-    except Exception:
-        gh_token = ""
-    if not gh_token:
-        # stable / no subscriber token: public release asset
-        return redirect("https://github.com/andrey271192/PCA_Phobos/releases/latest/download/PhobosWG.apk")
-    import urllib.request as _ur, ssl as _ssl, json as _json
-    _ctx = _ssl.create_default_context(); _ctx.check_hostname=False; _ctx.verify_mode=_ssl.CERT_NONE
-    try:
-        # /releases (all, incl. prereleases) — /releases/latest excludes prereleases
-        # and the beta APK release is a prerelease -> 404. Scan all releases for .apk.
-        _api = _ur.Request(
-            "https://api.github.com/repos/andrey271192/PCA_Phobos-dev/releases?per_page=20",
-            headers={"Authorization": f"token {gh_token}", "Accept": "application/vnd.github+json"})
-        _rels = _json.loads(_ur.urlopen(_api, context=_ctx, timeout=10).read())
-        if isinstance(_rels, dict):
-            _rels = [_rels]
-        _url = None
-        for _rel in _rels:
-            _url = next((a["url"] for a in _rel.get("assets", []) if a["name"].endswith(".apk")), None)
-            if _url:
-                break
-        if not _url:
-            return "APK asset not found in any release", 404
-        _req = _ur.Request(_url, headers={"Authorization": f"token {gh_token}",
-                                          "Accept": "application/octet-stream"})
-        _resp = _ur.urlopen(_req, context=_ctx, timeout=120)
-        from flask import Response
-        return Response(_resp.read(), mimetype="application/vnd.android.package-archive",
-                        headers={"Content-Disposition": "attachment; filename=PhobosWG.apk"})
-    except Exception as e:
-        return f"APK download failed: {e}", 500
+    return redirect(f"{PCA_GIT}/releases/download/{APK_TAG}/PhobosWG.apk")
 
 
 @app.route("/client/<cid>/conf/<mode>")
@@ -3385,7 +3348,7 @@ def client_phone(cid, mode):
             else:
                 apk_btn = (f'<p style="margin-top:6px"><a href="/download/apk" class="btn btn-primary" '
                            f'style="background:#16a34a">📥 {tr("Скачать PhobosWG (APK)","Download PhobosWG (APK)")}</a></p>')
-        client_btn = (f'<p style="margin-top:6px"><a href="https://github.com/andrey271192/PCA_Phobos/releases/latest/download/PCA-Phobos-VPN.apk" '
+        client_btn = (f'<p style="margin-top:6px"><a href="{PCA_GIT}/releases/download/{APK_TAG}/PCA-Phobos-VPN.apk" '
                       f'class="btn btn-primary" target="_blank" rel="noopener">🛡 {tr("PCA Phobos VPN — наше приложение (раздельный трафик)","PCA Phobos VPN — our app (split tunnelling)")}</a></p>'
                       f'<p style="font-size:.8em;color:var(--muted)">{tr("Поставь любое из двух приложений и открой ссылку ниже на телефоне — профиль импортируется сам.","Install either app and open the link below on the phone — the profile imports itself.")}</p>')
         extra = (client_btn + apk_btn +
