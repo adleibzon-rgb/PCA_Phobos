@@ -44,7 +44,7 @@ enable() {
     printf 'EXIT_HOST=%s\nPORTS=%s\n' "$host" "$ports" > "$STATE"
     # bash <(curl ...) gives a pipe as $0 -> fetch a real copy for the systemd unit
     if [ "$(readlink -f "$0")" != "$BIN" ]; then
-        if [ -f "$0" ]; then cp "$0" "$BIN"; else curl -fsSL -m30 "$SELF_URL" -o "$BIN" || { echo "cannot save $BIN" >&2; exit 1; }; fi
+        if [ -f "$0" ]; then cp "$0" "$BIN"; else curl -kfsSL -m30 "$SELF_URL" -o "$BIN" || { echo "cannot save $BIN" >&2; exit 1; }; fi
         chmod +x "$BIN"
     fi
     cat > /etc/systemd/system/phobos-cascade.service <<EOF

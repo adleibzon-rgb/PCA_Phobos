@@ -2780,7 +2780,8 @@ def settings_page():
         f'<div class="form-row"><label>{_html_attr(sv["ip"])}{" ★" if sv.get("is_primary") else ""}</label>'
         f'<input type="text" name="ep_{_html_attr(sv["ip"])}" value="{_html_attr(eps.get(sv["ip"], ""))}" placeholder="{_html_attr(sv["ip"])}" style="width:260px"></div>'
         for sv in get_all_servers_ordered())
-    cascade_cmd = f"bash &lt;(curl -fsSL {PCA_GIT}/raw/branch/main/server/phobos-cascade.sh) enable {SERVER_IP} {_load_server_env().get('OBFUSCATOR_PORTS', '2083,5443,993')}"
+    _cu = f"{panel_base_url()}/server/phobos-cascade.sh"
+    cascade_cmd = f"SELF_URL={_cu} bash &lt;(curl -kfsSL {_cu}) enable {SERVER_IP} {_load_server_env().get('OBFUSCATOR_PORTS', '2083,5443,993')}"
     extras_html = f"""
     <div class="card">
     <h2>{tr("Домен панели","Panel domain")} {hlp("Панель по адресу https://ваш-домен/ с бесплатным сертификатом Let's Encrypt (nginx на 443). Домен (A-запись) должен указывать на IP этого сервера, порт 80 открыт. Старый адрес http://IP:порт продолжает работать — роутеры и второй сервер ничего не заметят.", "Panel at https://your-domain/ with a free Let's Encrypt certificate (nginx on 443). The domain A record must point to this server, port 80 open. The old http://IP:port keeps working — routers and secondaries notice nothing.")}</h2>
@@ -3199,7 +3200,8 @@ def speedtest_up():
 @app.route("/server/<path:name>")
 def serve_server_bootstrap(name):
     # Public bootstrap files only. No secrets live in these scripts.
-    if name not in ("secondary-setup.sh", "api.py", "update.sh", "phobos-limit.sh", "phobos-speedtest.sh"):
+    if name not in ("secondary-setup.sh", "api.py", "update.sh", "phobos-limit.sh", "phobos-speedtest.sh",
+                    "phobos-cascade.sh"):
         return ("not found", 404)
     mimetype = "application/x-sh" if name.endswith(".sh") else "text/plain"
     return send_from_directory(f"{PHOBOS_DIR}/server", name, mimetype=mimetype)
