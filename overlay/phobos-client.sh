@@ -56,11 +56,11 @@ action_add() {
     for d in "$CLIENTS_DIR"/*; do
       if [[ -d "$d" ]] && [[ -f "$d/metadata.json" ]]; then
         local ip=$(jq -r '.tunnel_ip_v4 // empty' "$d/metadata.json" 2>/dev/null | cut -d/ -f1)
-        [[ -n "$ip" ]] && used_ips="${used_ips}${ip}"$'\n'
+        [[ -n "$ip" ]] && used_ips="${used_ips}${ip}\n"
       fi
     done
 
-    client_ip_v4="$(USED_IPS="$used_ips" python3 - "$server_wg_network" <<'PY'
+    client_ip_v4="$(USED_IPS="$(printf "%b" "$used_ips")" python3 - "$server_wg_network" <<'PY'
 import ipaddress
 import os
 import sys
@@ -123,7 +123,7 @@ EOF
 [instance]
 source-if = 127.0.0.1
 source-lport = ${CLIENT_WG_PORT:-13255}
-target = $SERVER_PUBLIC_IP_V4:${OBFUSCATOR_PORT:-51821}
+target = ${CLIENT_ENDPOINT:-$SERVER_PUBLIC_IP_V4}:${OBFUSCATOR_PORT:-51821}
 key = ${OBFUSCATOR_KEY:-KEY}
 masking = ${OBFUSCATOR_MASKING:-AUTO}
 verbose = INFO
@@ -213,6 +213,7 @@ action_package() {
   local tmp=$(mktemp -d)
   local pkg_root="$tmp/phobos-$id"
   
+  mkdir -p "$PHOBOS_DIR/bin"
   mkdir -p "$pkg_root/bin"
   
   cp "$dir/${id}.conf" "$pkg_root/${id}.conf"
@@ -239,7 +240,7 @@ action_package() {
 
   if [[ -d "$tpl_dir" ]]; then
      for required in install-router.sh.template lib-client.sh install-obfuscator.sh install-wireguard.sh; do
-       [[ -f "$tpl_dir/$required" ]] || die "Обязательный шаблон $required не найден в $tpl_dir. Выполни phobos-update stable и пересоздай пакет."
+       [[ -f "$tpl_dir/$required" ]] || die "Обязательный шаблон $required не найден в $tpl_dir. Выполни phobos-update и пересоздай пакет."
      done
      cp "$tpl_dir/install-router.sh.template" "$pkg_root/install-router.sh"
      sed -i "s|{{CLIENT_NAME}}|${id}|g" "$pkg_root/install-router.sh"
@@ -273,10 +274,42 @@ action_package() {
   [[ -n "$PULL_TOKEN" ]] && echo "$PULL_TOKEN" > "$pkg_root/pull_token"
   # Generate failover.conf with current server data
   source "$PHOBOS_DIR/server/server.env"
+  local panel_port="${HTTP_PORT:-}"
+  if [[ -z "$panel_port" && -f /opt/phobos-panel/.port ]]; then
+    panel_port=$(cat /opt/phobos-panel/.port 2>/dev/null || true)
+  fi
+  panel_port="${panel_port:-8443}"
+  local panel_scheme="${PANEL_SCHEME:-}"
+  if [[ -z "$panel_scheme" && -f /opt/phobos-panel/.scheme ]]; then
+    panel_scheme=$(cat /opt/phobos-panel/.scheme 2>/dev/null || true)
+  fi
+  case "$panel_scheme" in http|https) ;; *) panel_scheme="http";; esac
+  local panel_tunnel_ip=""
+  panel_tunnel_ip="$(python3 - "${SERVER_WG_IPV4_ADDRESS:-}" "${SERVER_WG_IPV4_NETWORK:-10.25.0.0/16}" <<'PY'
+import ipaddress, sys
+iface = (sys.argv[1] or "").strip()
+network = (sys.argv[2] or "10.25.0.0/16").strip()
+if iface:
+    try:
+        print(ipaddress.ip_interface(iface).ip)
+        raise SystemExit(0)
+    except Exception:
+        pass
+net = ipaddress.ip_network(network, strict=False)
+print(next(net.hosts()))
+PY
+)"
+  [[ -n "$panel_tunnel_ip" ]] && echo "$panel_tunnel_ip" > "$pkg_root/panel_tunnel_ip"
+  echo "$panel_port" > "$pkg_root/panel_port"
+  echo "$panel_scheme" > "$pkg_root/panel_scheme"
+  echo "${panel_scheme}://${SERVER_PUBLIC_IP_V4}:${panel_port}" > "$pkg_root/panel_url"
+  printf 'http://%s:8444 %s://%s:%s %s://%s:%s\n' \
+    "$panel_tunnel_ip" "$panel_scheme" "$panel_tunnel_ip" "$panel_port" \
+    "$panel_scheme" "$SERVER_PUBLIC_IP_V4" "$panel_port" > "$pkg_root/panel_urls"
   cat > "$pkg_root/failover.conf" <<FAILEOF
 # Phobos Failover Configuration
-SERVER_1=${SERVER_PUBLIC_IP_V4}:${OBFUSCATOR_PORTS:-51821,51822,51823}
-KEY_1=${OBFUSCATOR_KEY}
+SERVER_1=${CLIENT_ENDPOINT:-$SERVER_PUBLIC_IP_V4}:${OBFUSCATOR_PORTS:-51821,51822,51823}
+KEY_1=${OBFUSCATOR_KEY:-}
 FAILEOF
   
   find "$pkg_root" -type f ! -path "*/bin/*" -exec sed -i 's/\r$//' {} \;
@@ -355,8 +388,13 @@ action_link() {
   if [[ -z "$panel_port" && -f /opt/phobos-panel/.port ]]; then
     panel_port=$(cat /opt/phobos-panel/.port 2>/dev/null || true)
   fi
-  panel_port="${panel_port:-80}"
-  local primary_url="http://${SERVER_PUBLIC_IP_V4}:${panel_port}/packages/$token/phobos-$id.tar.gz"
+  panel_port="${panel_port:-8443}"
+  local panel_scheme="${PANEL_SCHEME:-}"
+  if [[ -z "$panel_scheme" && -f /opt/phobos-panel/.scheme ]]; then
+    panel_scheme=$(cat /opt/phobos-panel/.scheme 2>/dev/null || true)
+  fi
+  case "$panel_scheme" in http|https) ;; *) panel_scheme="http";; esac
+  local primary_url="${panel_scheme}://${SERVER_PUBLIC_IP_V4}:${panel_port}/packages/$token/phobos-$id.tar.gz"
   local fallback_url="http://${SERVER_PUBLIC_IP_V4}:80/packages/$token/phobos-$id.tar.gz"
 
   cat > "$WWW_DIR/init/$token.sh" <<EOF
@@ -366,12 +404,12 @@ dir="/tmp/phobos_install_\$\$"
 mkdir -p "\$dir"
 echo "Downloading..."
 ok=0
-for url in \$urls; do
+  for url in \$urls; do
   rm -f "\$dir/package.tar.gz"
   if command -v curl >/dev/null; then
-    curl -L -s -o "\$dir/package.tar.gz" "\$url" 2>/dev/null || continue
+    curl -k -L -s -o "\$dir/package.tar.gz" "\$url" 2>/dev/null || continue
   else
-    wget -q -O "\$dir/package.tar.gz" "\$url" 2>/dev/null || continue
+    wget --no-check-certificate -q -O "\$dir/package.tar.gz" "\$url" 2>/dev/null || wget -q -O "\$dir/package.tar.gz" "\$url" 2>/dev/null || continue
   fi
   if grep -qi '<html' "\$dir/package.tar.gz" 2>/dev/null; then
     echo "Bad response from \$url (HTML/proxy page), trying next..."
@@ -399,9 +437,9 @@ EOF
   chmod 755 "$PACKAGES_DIR" 2>/dev/null
   chmod 644 "$PACKAGES_DIR/phobos-$id.tar.gz" 2>/dev/null
 
-  local init_primary="http://${SERVER_PUBLIC_IP_V4}:${panel_port}/init/$token.sh"
+  local init_primary="${panel_scheme}://${SERVER_PUBLIC_IP_V4}:${panel_port}/init/$token.sh"
   local init_fallback="http://${SERVER_PUBLIC_IP_V4}:80/init/$token.sh"
-  local cmd="tmp=/tmp/phobos-init-\$\$.sh; ok=0; for u in $init_primary $init_fallback; do rm -f \$tmp; (wget -q -O \$tmp \$u || curl -fsSL -o \$tmp \$u) 2>/dev/null || continue; grep -qi '<html' \$tmp && continue; head -1 \$tmp | grep -q '^#!' || continue; sh \$tmp; ok=1; break; done; rm -f \$tmp; [ \$ok -eq 1 ] || echo 'ERROR: install script download failed (got HTML/proxy page or timeout)'"
+  local cmd="p=/tmp/phobos-init-\$\$.sh; ok=0; for u in $init_primary $init_fallback; do rm -f \$p; (wget -q -O \$p \$u || wget --no-check-certificate -q -O \$p \$u || curl -kfsSL -o \$p \$u || curl -fsSL -o \$p \$u) 2>/dev/null || continue; head -c 2 \$p | grep -q \"#!\" || continue; sh \$p && ok=1 && break; done; rm -f \$p; [ \$ok -eq 1 ] || echo ERROR_install_script_download_failed"
 
   echo ""
   echo "=================================================="

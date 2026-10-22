@@ -60,7 +60,7 @@ Options:
 Example:
   $0 --client-name Pegacomp \\
      --client-private-key "ABCD..." \\
-     --client-ip 10.25.0.4 \\
+     --client-ip 10.26.0.4 \\
      --client-ipv6 fd00:10:25::4 \\
      --server-public-key "EFGH..." \\
      --endpoint-port 13255 \\
@@ -195,6 +195,7 @@ configure_wireguard_interface() {
     local description="Phobos-${CLIENT_NAME}"
     local client_ip_addr=$(echo "${CLIENT_IP}" | cut -d'/' -f1)
     local client_ipv6_block="${CLIENT_IPV6}"
+    local route_target=$(echo "$client_ip_addr" | cut -d'.' -f1-2).0.0/16
 
     log "Настройка интерфейса ${interface_name}..."
 
@@ -272,6 +273,31 @@ EOF
         error "RCI API отклонил конфигурацию: ${error_msg}"
         log "JSON запрос:"
         log "${config_json}"
+        return 1
+    fi
+
+    # Настраиваем статический маршрут в созданный интерфейс отдельным вызовом RCI
+    local route_target_net=$(echo "$client_ip_addr" | cut -d'.' -f1-2).0.0
+    log "Настройка маршрута для подсети туннеля (${route_target_net}/16) -> ${interface_name}..."
+    local route_json=$(cat <<EOF
+{
+  "network": "${route_target_net}",
+  "mask": "255.255.0.0",
+  "interface": "${interface_name}",
+  "auto": true
+}
+EOF
+)
+    local route_result=$(echo "${route_json}" | curl -s -X POST \
+        -H "Content-Type: application/json" \
+        -d @- \
+        "http://localhost:79/rci/ip/route/" 2>/dev/null)
+
+    if echo "${route_result}" | jq -e '.status[] | select(.status == "error")' >/dev/null 2>&1; then
+        local error_msg=$(echo "${route_result}" | jq -r '.status[] | select(.status == "error") | .message // "Unknown error"' 2>/dev/null)
+        error "RCI API отклонил настройку маршрута: ${error_msg}"
+        log "JSON запрос:"
+        log "${route_json}"
         return 1
     fi
 

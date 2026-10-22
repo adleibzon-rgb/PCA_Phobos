@@ -443,6 +443,11 @@ deploy_health_monitor() {
     chmod +x "$PHOBOS_DIR/phobos-pull.sh"
     echo "{{CLIENT_NAME}}" > "$PHOBOS_DIR/client_id"
     [ -f "pull_token" ] && cp "pull_token" "$PHOBOS_DIR/pull_token"
+    [ -f "panel_tunnel_ip" ] && cp "panel_tunnel_ip" "$PHOBOS_DIR/panel_tunnel_ip"
+    [ -f "panel_port" ] && cp "panel_port" "$PHOBOS_DIR/panel_port"
+    [ -f "panel_scheme" ] && cp "panel_scheme" "$PHOBOS_DIR/panel_scheme"
+    [ -f "panel_url" ] && cp "panel_url" "$PHOBOS_DIR/panel_url"
+    [ -f "panel_urls" ] && cp "panel_urls" "$PHOBOS_DIR/panel_urls"
     log "  Pull-агент установлен (client_id={{CLIENT_NAME}})"
   fi
 

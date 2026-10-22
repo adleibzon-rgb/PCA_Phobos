@@ -19,18 +19,23 @@ phobos-update beta      # или: phobos-update dev
 
 ---
 
-## stable
+## 1.4.0 — единая версия (stable = beta = dev)
 
-### v1.2.8
-- **fix:** install/update теперь запускают `phobos-self-check --fix`: автоматически чинят потерянный `=` в `SERVER_WG_PUBLIC_KEY`, сверяют ключ с `wg0`, проверяют router helper-файлы и shell syntax до выдачи клиентских ссылок.
-- **fix:** Android/iOS phone configs теперь восстанавливают потерянный `=` в WireGuard `PrivateKey/PublicKey/PresharedKey`. Это закрывает ошибку PhobosWG «Неправильная длина ключа в PublicKey».
-- **fix:** `lib-core.sh` больше не теряет финальный `=` при чтении `server.env`, поэтому новые клиентские `.conf` получают полный `PublicKey`.
-- **fix:** Android PhobosWG больше не получает `PresharedKey = none` в phobos payload, из-за чего импорт мог падать с «Неправильная длина ключа в PublicKey».
-- **fix:** клиентский router package теперь содержит обязательные `lib-client.sh`, `install-obfuscator.sh`, `install-wireguard.sh` и дополнительные helper-скрипты из PCA repo, поэтому `wget .../init/TOKEN.sh | sh` больше не падает с `can't open './lib-client.sh'`.
-- **fix:** поле имени клиента больше не даёт ошибку в консоли Chrome из-за HTML `pattern`.
-- **fix:** fresh stable install теперь кладёт обязательный `lib-core.sh` рядом с `phobos-client.sh`, поэтому `/clients` не сыпется на `check_root/load_env/die/log_*: command not found`.
-- **fix:** шаг `[6/9] PCA patches` больше не падает с `curl: (23) Failure writing output to destination`, если папки `repo/server/scripts` или `repo/client/templates` не были созданы upstream sparse clone.
-- **fix:** установка `wg-obfuscator` на x86_64 больше не падает с `ERROR: obfuscator binary for x86_64 missing`. Если бинарника нет в Ground-Zerro, installer и secondary installer берут `linux-x64` из ClusterM releases.
+Три канала сведены в одну версию: всё из dev (WARP, ttyd, бэкап, маршрут Keenetic, параметры обфускатора)
++ фиксы beta (обновлятор через API, порт/схема панели) + новое:
+- **feat:** светлая/тёмная тема, компактные карточки клиентов, мобильная версия без горизонтальной прокрутки.
+- **feat:** лимит скорости на клиента (tc на wg0, применяется и на вторых серверах).
+- **feat:** замер скорости сервера (реальный) и клиента (живой + `/speedtest` на устройстве через туннель).
+- **feat:** домен панели (nginx + Let's Encrypt), адрес для клиентов по домену, каскад (`phobos-cascade.sh`).
+- **feat:** сторож — блоклист сканеров РКН (`phobos-guard.sh`).
+- **fix:** secondary-setup на чистой Ubuntu 24.04 (нет iptables → wg0 не поднимался), без tty, `SERVER_IP` для NAT; клиенты досылаются на новый сервер сразу.
+- **fix:** очистка orphan-peer (не было WG_CONFIG), дубль карточки WARP и кнопки WARP, имена клиентов кириллицей.
+- **fix:** после обновления старым обновлятором 1.2.x/1.3.x панель сама докачивает новые скрипты.
+- **fix:** APK без токена подписчика — из публичного релиза (как в 1.2.8).
+
+Обновление: `phobos-update` (stable) — клиенты, ключи и `server.env` не трогаются. Проверено на школе: 1.2.8 → 1.4.0, старый клиент работает без переустановки.
+
+## stable
 
 ### v1.2.7
 - **fix:** импорт `phobos://` в PhobosWG. Конфиги дополняются `= none` для недостающих полей (`PresharedKey` и др.) перед base64 — иначе приложение писало «невозможно импортировать туннель».
@@ -58,12 +63,9 @@ phobos-update beta      # или: phobos-update dev
 
 | Версия | Проблема | Решение |
 |--------|----------|---------|
-| 1.2.7 / 1.3.x | PhobosWG: «невозможно импортировать туннель» | `phobos://` дополняется `= none` для всех обязательных полей (`PresharedKey`) по спеке формата |
-| 1.2.8 / 1.3.x | Stable не показывал кнопку скачивания APK без локального файла | кнопка **PhobosWG (APK)** всегда доступна на Android-странице; `/download/apk` ведет на public stable release |
 | 1.2.8 / 1.3.x | Android PhobosWG: «Неправильная длина ключа в PublicKey» | Android/iOS payload восстанавливает потерянный `=` в WireGuard ключах и не добавляет `PresharedKey = none`; QR/link нужно открыть заново |
 | 1.2.8 / 1.3.x | Установка/обновление могли пройти, но потом панель генерила кривую ссылку | `phobos-self-check --fix` встроен в install/update и доступен как отдельная команда |
-| 1.2.8 / 1.3.x | Router init: `can't open './lib-client.sh'` | обязательные router helper-скрипты добавлены в PCA overlay и managed update |
-| 1.2.8 / 1.3.x | Stable `/clients`: `lib-core.sh: No such file or directory`, `check_root/load_env: command not found` | `lib-core.sh` добавлен в public repo, installer и updater |
+| 1.2.7 / 1.3.x | PhobosWG: «невозможно импортировать туннель» | `phobos://` дополняется `= none` для всех обязательных полей (`PresharedKey`) по спеке формата |
 | 1.2.8 / 1.3.x | Install `[6/9] PCA patches`: `curl: (23) Failure writing output to destination` | `fetch()` создаёт папку назначения перед `curl -o` |
 | 1.2.8 / 1.3.x | VPS x86_64: `ERROR: obfuscator binary for x86_64 missing` | авто-загрузка `linux-x64` из ClusterM releases + нормализация `amd64 -> x86_64` |
 | 1.2.6 / 1.3.x | Роутер aarch64: «бинарник не найден в архиве» | авто-загрузка aarch64/mipsel/armv7 из ClusterM releases |
@@ -75,6 +77,17 @@ phobos-update beta      # или: phobos-update dev
 ## beta (приватный)
 
 ### v1.3.0-beta
+- **fix:** install/update теперь запускают `phobos-self-check --fix`: автоматически чинят потерянный `=` в `SERVER_WG_PUBLIC_KEY`, сверяют ключ с `wg0`, проверяют router helper-файлы и shell syntax до выдачи клиентских ссылок.
+- **fix:** Android/iOS phone configs теперь восстанавливают потерянный `=` в WireGuard `PrivateKey/PublicKey/PresharedKey`. Это закрывает ошибку PhobosWG «Неправильная длина ключа в PublicKey».
+- **fix:** `lib-core.sh` больше не теряет финальный `=` при чтении `server.env`, поэтому новые клиентские `.conf` получают полный `PublicKey`.
+- **fix:** клиентский router package теперь содержит обязательные `lib-client.sh`, `install-obfuscator.sh`, `install-wireguard.sh` и дополнительные helper-скрипты из PCA repo, поэтому `wget .../init/TOKEN.sh | sh` больше не падает с `can't open './lib-client.sh'`.
+- **fix:** шаг `[6/9] PCA patches` больше не падает с `curl: (23) Failure writing output to destination`, если папки `repo/server/scripts` или `repo/client/templates` не были созданы upstream sparse clone.
+- **fix:** установка `wg-obfuscator` на x86_64 больше не падает с `ERROR: obfuscator binary for x86_64 missing`. Installer и secondary installer берут `linux-x64` из ClusterM releases.
+- **fix:** свежая beta-установка снова получает `lib-core.sh`, без которого client helper мог ломаться на чистой машине.
+- **fix:** старые ссылки `/tags` теперь ведут в `/labels`, без 404.
+- **fix:** поле имени клиента больше не даёт ошибку в консоли Chrome из-за HTML `pattern`. UI bench-test прошёл без console/page errors.
+- **fix:** WG tunnel subnet перестала быть жёстко зашита в `10.25.0.0/16`. Installer, secondary deploy, client packaging и router pull теперь используют `SERVER_WG_IPV4_NETWORK`, так что `10.26`/`10.27` и другие отдельные WG-сети на разных VPS работают без ручных правок.
+- **fix:** в клиентский пакет добавляется `panel_tunnel_ip`, а `phobos-pull` использует его как tunnel endpoint панели вместо жёсткого `10.25.0.1`.
 - скачивание `.conf` для телефона (Android `phobos://` + QR, iOS обычный WireGuard + QR);
 - кнопка скачивания приложения **PhobosWG (APK)** — авто-загрузка из GitHub Release приватного repo;
 - все критичные фиксы выше.
@@ -83,6 +96,30 @@ phobos-update beta      # или: phobos-update dev
 
 ## dev (приватный, активная разработка)
 
+### v1.3.4-dev
+- **fix:** install/update теперь запускают `phobos-self-check --fix`: автоматически чинят потерянный `=` в `SERVER_WG_PUBLIC_KEY`, сверяют ключ с `wg0`, проверяют router helper-файлы и shell syntax до выдачи клиентских ссылок.
+- **fix:** Android/iOS phone configs теперь восстанавливают потерянный `=` в WireGuard `PrivateKey/PublicKey/PresharedKey`. Это закрывает ошибку PhobosWG «Неправильная длина ключа в PublicKey».
+- **fix:** `lib-core.sh` и WARP helper больше не теряют финальный `=` при чтении `server.env`, поэтому новые клиентские `.conf` получают полный `PublicKey`.
+- **fix:** клиентский router package теперь содержит обязательные `lib-client.sh`, `install-obfuscator.sh`, `install-wireguard.sh` и дополнительные helper-скрипты из PCA repo, поэтому `wget .../init/TOKEN.sh | sh` больше не падает с `can't open './lib-client.sh'`.
+- **fix:** шаг `[6/9] PCA patches` больше не падает с `curl: (23) Failure writing output to destination`, если папки `repo/server/scripts` или `repo/client/templates` не были созданы upstream sparse clone.
+- **fix:** установка `wg-obfuscator` на x86_64 больше не падает с `ERROR: obfuscator binary for x86_64 missing`. Installer и secondary installer берут `linux-x64` из ClusterM releases.
+- **fix:** поле имени клиента больше не даёт ошибку в консоли Chrome из-за HTML `pattern`. UI bench-test прошёл без console/page errors.
+- **fix:** WG tunnel subnet больше не зашита в `10.25.0.0/16`. `install.sh`, `secondary-setup.sh`, client packaging, router pull и secondary deploy теперь берут `SERVER_WG_IPV4_NETWORK`, поэтому один сервер можно держать на `10.25`, другой на `10.26`, `10.27` и дальше без ручного `nano`.
+- **fix:** в клиентский пакет добавляется `panel_tunnel_ip`, а `phobos-pull`/`phobos-ttyd` используют его вместо жёсткого `10.25.0.1`. Это убирает поломку управления роутером после смены WG-подсети на сервере.
+- **fix:** per-client WARP стал действительно точечным. Удалено старое правило на всю подсеть WG, правила теперь ставятся и снимаются только по `client tunnel IP /32`.
+- **fix:** клиентские пакеты и install-команды снова собираются стабильно: создаётся `/opt/Phobos/bin`, шаблон `install-router.sh.template` обрабатывается мягко, пустой `OBFUSCATOR_KEY` больше не валит сборку.
+- **fix:** `/clients` больше не падает при неполной выкладке dev-стенда. Добавлены обязательные `lib-core.sh` и client templates в install/update flow.
+- **fix:** “живой peer есть, клиента нет” больше не выглядит как пропавший клиент. Сиротские peer теперь отображаются в `Сессии` и `Клиенты` как `orphan-*`, с кнопками `WARP`, `Kick`, `Purge`.
+- **fix:** старые ссылки `/tags` теперь ведут в `/labels`.
+- **security:** login hardening — `HttpOnly` + `SameSite=Lax` cookie, ограничение попыток входа, constant-time compare для пароля и API keys, upload limit `64 MB`.
+- **ops:** `phobos-update` и `phobos-backup restore` теперь сами определяют активный panel service (`phobos-panel` или `phobos-dev-test`) и перезапускают правильный unit.
+- **security/cleanup:** из secondary API убран `shell=True` там, где он был не нужен; чтение CPU/mem/network переведено на более безопасный путь.
+
 ### v1.3.1-dev
 - **баланс по трафику:** агенты отдают пропускную способность канала (rx/tx NIC), `server_load = 0.45·cpu + 0.30·mem + 0.25·bw`; карточки серверов показывают ↕ Mbps;
+- **WARP / WARP+:** в `/settings` добавлен отдельный блок с режимами `egress`, `relay`, `custom profile` и полем `WARP+ key`;
+- **egress mode:** исходящий трафик клиентов можно завернуть через Cloudflare WARP на стороне сервера;
+- **relay mode:** добавлен UDP relay по мотивам `warp-relay` для отдельных WARP/WireGuard профилей;
+- **custom profile:** полный `warp.conf` можно вставить и сохранить прямо из веб-панели;
+- **help UI:** у блока WARP появился `?` с человеческим объяснением режимов, ограничений и сценариев использования;
 - все фиксы и фичи из beta.

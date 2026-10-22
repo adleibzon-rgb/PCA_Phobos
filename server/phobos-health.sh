@@ -25,7 +25,10 @@ PRIMARY_CHECK_INTERVAL=300
 # wg-obfuscator-* services are active — the bare panel port stays up even
 # when the tunnel path is dead, so we must NOT switch back on panel liveness
 # alone (that caused premature switchback to a dead primary).
-PRIMARY_PROBE_PORT=10514
+PRIMARY_PROBE_SCHEME="${PRIMARY_PROBE_SCHEME:-$(cat "$PHOBOS_DIR/panel_scheme" 2>/dev/null)}"
+PRIMARY_PROBE_SCHEME="${PRIMARY_PROBE_SCHEME:-http}"
+PRIMARY_PROBE_PORT="${PRIMARY_PROBE_PORT:-$(cat "$PHOBOS_DIR/panel_port" 2>/dev/null)}"
+PRIMARY_PROBE_PORT="${PRIMARY_PROBE_PORT:-8443}"
 PRIMARY_PROBE_PATH="/api/obf-health"
 # Connectivity check targets (logged for context only)
 CHECK_HOST_1="8.8.8.8"
@@ -274,13 +277,22 @@ check_primary() {
     # Probe the obfuscator-health endpoint: http 200 ONLY when the primary's
     # obfuscator path is actually up. Anything else (000 no-response, 503
     # obf-down, redirects) means the tunnel path is NOT viable → stay put.
-    code=$(curl -s -m 4 -o /dev/null -w '%{http_code}' "http://${host}:${PRIMARY_PROBE_PORT}${PRIMARY_PROBE_PATH}" 2>/dev/null)
-    if [ "$code" = "200" ]; then
-        log "PRIMARY ($host obf-health http=200) alive, switching back"
+    ok_url=""
+    last_code=""
+    for url in "${PRIMARY_PROBE_SCHEME}://${host}:${PRIMARY_PROBE_PORT}${PRIMARY_PROBE_PATH}" "http://${host}:8444${PRIMARY_PROBE_PATH}"; do
+        code=$(curl -k -s -m 4 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null)
+        last_code="$code"
+        if [ "$code" = "200" ]; then
+            ok_url="$url"
+            break
+        fi
+    done
+    if [ -n "$ok_url" ]; then
+        log "PRIMARY ($ok_url http=200) alive, switching back"
         switch_endpoint 1 0
         echo "0" > "$STATE/fail_count"
     else
-        log "PRIMARY still down (obf-health http=${code:-none}), staying on server $CURRENT_SERVER"
+        log "PRIMARY still down (obf-health http=${last_code:-none}), staying on server $CURRENT_SERVER"
     fi
 }
 

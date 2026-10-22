@@ -24,14 +24,18 @@ PHOBOS_DIR="/opt/etc/Phobos"
 CONF="$PHOBOS_DIR/failover.conf"
 HEALTH="$PHOBOS_DIR/phobos-health.sh"
 LOG="$PHOBOS_DIR/health.log"
-# Config sources, tried in order. TUNNEL FIRST: 10.25.0.1 is the wg0 of whatever
-# server the tunnel currently terminates on, so management rides the same
-# obfuscated channel as data — survives a public-IP ban and follows failover.
-#   - 10.25.0.1:8444   -> secondary server agent (phobos-api)
-#   - 10.25.0.1:10514  -> primary server panel
+# Config sources, tried in order. TUNNEL FIRST: panel_tunnel_ip is the wg0 of
+# whatever server the tunnel currently terminates on, so management rides the
+# same obfuscated channel as data — survives a public-IP ban and follows
+# failover.
+#   - panel_tunnel_ip:8444   -> secondary server agent (phobos-api)
+#   - panel_tunnel_ip:<panel_port> -> primary server panel
 #   - public panel IP  -> bootstrap / if tunnel is down
-PANEL="${PANEL:-http://212.118.52.193:10514}"
-PANEL_URLS="${PANEL_URLS:-http://10.25.0.1:8444 http://10.25.0.1:10514 $PANEL}"
+PANEL_TUNNEL_IP="${PANEL_TUNNEL_IP:-$(cat "$PHOBOS_DIR/panel_tunnel_ip" 2>/dev/null)}"
+[ -n "$PANEL_TUNNEL_IP" ] || PANEL_TUNNEL_IP="10.25.0.1"
+PANEL="${PANEL:-$(cat "$PHOBOS_DIR/panel_url" 2>/dev/null)}"
+PANEL_URLS="${PANEL_URLS:-$(cat "$PHOBOS_DIR/panel_urls" 2>/dev/null)}"
+[ -n "$PANEL_URLS" ] || PANEL_URLS="http://${PANEL_TUNNEL_IP}:8444 $PANEL"
 CLIENT_ID=$(cat "$PHOBOS_DIR/client_id" 2>/dev/null || echo "home")
 TOKEN=$(cat "$PHOBOS_DIR/pull_token" 2>/dev/null)
 TMP="/tmp/failover.conf.pull"
@@ -50,21 +54,24 @@ trap 'rm -f "$LOCK"' EXIT
 [ -z "$TOKEN" ] && exit 0
 
 detect_tunnel_iface() {
-    ip -o addr show 2>/dev/null | awk '$4 ~ /^10\.25\./ {print $2; exit}'
+    ip route get "$PANEL_TUNNEL_IP" 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1)}' | head -1
 }
 
 fetch_config() {
     base="$1"
     url="${base}/api/router-config/${CLIENT_ID}?token=${TOKEN}"
     case "$base" in
-        http://10.25.0.1:*|https://10.25.0.1:*)
+        "http://${PANEL_TUNNEL_IP}:"*|"https://${PANEL_TUNNEL_IP}:"*)
             iface=$(detect_tunnel_iface)
             if [ -n "$iface" ] && command -v curl >/dev/null; then
-                curl --interface "$iface" -s -m 8 -o "$TMP" "$url" 2>/dev/null && return 0
+                curl -k --interface "$iface" -s -m 8 -o "$TMP" "$url" 2>/dev/null && return 0
             fi
             ;;
     esac
-    curl -s -m 8 -o "$TMP" "$url" 2>/dev/null
+    if command -v curl >/dev/null; then
+        curl -k -s -m 8 -o "$TMP" "$url" 2>/dev/null && return 0
+    fi
+    wget --no-check-certificate -q -O "$TMP" "$url" 2>/dev/null || wget -q -O "$TMP" "$url" 2>/dev/null
 }
 
 # One fetch + compare + apply pass. Returns 0 always (best-effort).

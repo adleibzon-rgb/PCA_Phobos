@@ -13,6 +13,7 @@
 #
 #  Env (all optional):
 #    PANEL_PORT   random 10000-59999   web panel port
+#    PANEL_TLS_CERT / PANEL_TLS_KEY     enable native HTTPS for panel
 #    PANEL_PASS   OcAdmin2026!         panel admin password
 #    API_KEY      random               shared key (agents + router pull token)
 #    OBF_PORTS    2083,5443,993        obfuscator listen ports
@@ -22,15 +23,21 @@
 set -e
 
 PANEL_PASS="${PANEL_PASS:-OcAdmin2026!}"
+PANEL_TLS_CERT="${PANEL_TLS_CERT:-}"
+PANEL_TLS_KEY="${PANEL_TLS_KEY:-}"
+PANEL_SCHEME="${PANEL_SCHEME:-http}"
 TG_TOKEN="${TG_TOKEN:-}"
 TG_CHAT="${TG_CHAT:-}"
 OBF_PORTS="${OBF_PORTS:-2083,5443,993}"
+SERVER_WG_IPV4_NETWORK="${SERVER_WG_IPV4_NETWORK:-10.25.0.0/16}"
 # Каналы: stable (открытый, публичный repo) · beta (тест) · dev (разработка).
 # beta и dev живут в ПРИВАТНОМ repo PCA_Phobos-dev — доступ по токену подписчика
 # (GH_TOKEN, read-only, выдаётся по подписке Boosty). stable — без токена.
 GH_TOKEN="${GH_TOKEN:-}"
 PUB_REPO="andrey271192/PCA_Phobos"
 DEV_REPO="andrey271192/PCA_Phobos-dev"
+PHOBOSWG_APK_TAG="v1.3.0-beta"
+PHOBOSWG_APK_SHA256="5399de7c576d56e491a01ab9b52d53c08d30a34d1156c1cb0f4520bf34821e02"
 CHANNEL="${CHANNEL:-stable}"
 case "$CHANNEL" in
   beta) REPO="$DEV_REPO"; PCA_BRANCH="${PCA_BRANCH:-beta}";;
@@ -50,13 +57,31 @@ fi
 PHOBOS_DIR="/opt/Phobos"
 PANEL_DIR="/opt/phobos-panel"
 RAW="https://raw.githubusercontent.com/${REPO}/${PCA_BRANCH}"
+SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 [ "$EUID" -eq 0 ] || { echo "Run as root"; exit 1; }
 
 if [ -z "$PANEL_PORT" ]; then
     PANEL_PORT=$(shuf -i 10000-59999 -n 1 2>/dev/null || awk 'BEGIN{srand(); print int(10000+rand()*50000)}')
 fi
+if [ -n "$PANEL_TLS_CERT" ] || [ -n "$PANEL_TLS_KEY" ]; then
+    [ -f "$PANEL_TLS_CERT" ] || { echo "ERROR: PANEL_TLS_CERT not found: $PANEL_TLS_CERT"; exit 1; }
+    [ -f "$PANEL_TLS_KEY" ] || { echo "ERROR: PANEL_TLS_KEY not found: $PANEL_TLS_KEY"; exit 1; }
+    PANEL_SCHEME="https"
+fi
+case "$PANEL_SCHEME" in http|https) ;; *) echo "ERROR: PANEL_SCHEME must be http or https"; exit 1;; esac
 API_KEY="${API_KEY:-$(head -c 24 /dev/urandom | base64 | tr -d '/+=' | head -c 24)}"
+WG_SERVER_IPV4="$(python3 - "$SERVER_WG_IPV4_NETWORK" <<'PY'
+import ipaddress, sys
+net = ipaddress.ip_network(sys.argv[1], strict=False)
+print(next(net.hosts()))
+PY
+)"
+WG_PREFIXLEN="$(python3 - "$SERVER_WG_IPV4_NETWORK" <<'PY'
+import ipaddress, sys
+print(ipaddress.ip_network(sys.argv[1], strict=False).prefixlen)
+PY
+)"
 
 SERVER_IP=$(curl -s -m8 https://api.ipify.org || hostname -I | awk '{print $1}')
 IFACE=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1)}' | head -1)
@@ -73,8 +98,18 @@ echo "============================================"
 echo "[1/9] dependencies..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq wireguard wireguard-tools iptables jq curl git \
-    python3 python3-flask gunicorn nginx cron python3-qrcode >/dev/null
+apt-get install -y -qq wireguard wireguard-tools iptables jq curl git ca-certificates \
+    python3 python3-flask python3-pip gunicorn nginx cron python3-qrcode sshpass >/dev/null
+apt-get install -y -qq python3-flask-sock >/dev/null 2>&1 || true
+apt-get install -y -qq python3-asyncssh >/dev/null 2>&1 || true
+apt-get install -y -qq python3-websocket >/dev/null 2>&1 || true
+python3 - <<'PY' >/dev/null 2>&1 || python3 -m pip install flask-sock asyncssh websocket-client >/dev/null 2>&1 || python3 -m pip install --break-system-packages flask-sock asyncssh websocket-client >/dev/null
+import flask_sock, asyncssh, websocket
+PY
+mkdir -p "$PANEL_DIR/static"
+curl -fsSL -m20 https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.css -o "$PANEL_DIR/static/xterm.min.css" 2>/dev/null || true
+curl -fsSL -m20 https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.js -o "$PANEL_DIR/static/xterm.min.js" 2>/dev/null || true
+curl -fsSL -m20 https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.8.0/lib/xterm-addon-fit.js -o "$PANEL_DIR/static/xterm-addon-fit.min.js" 2>/dev/null || true
 systemctl enable cron -q 2>/dev/null || true; systemctl start cron 2>/dev/null || true
 
 # ── 2. wg-obfuscator binary (Ground-Zerro) ──
@@ -126,7 +161,7 @@ if [ ! -f /etc/wireguard/wg0.conf ]; then
     WG_PRIV=$(wg genkey); WG_PUB=$(echo "$WG_PRIV" | wg pubkey)
     cat > /etc/wireguard/wg0.conf <<WG
 [Interface]
-Address = 10.25.0.1/16
+Address = ${WG_SERVER_IPV4}/${WG_PREFIXLEN}
 ListenPort = 51820
 PrivateKey = $WG_PRIV
 PostUp = iptables -I FORWARD 1 -i wg0 -j ACCEPT; iptables -I FORWARD 1 -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -A POSTROUTING -o $IFACE -j MASQUERADE
@@ -186,6 +221,8 @@ cat > "$PHOBOS_DIR/server/server.env" <<EOF
 SERVER_WG_PRIVATE_KEY=$WG_PRIV
 SERVER_WG_PUBLIC_KEY=$WG_PUB
 SERVER_PUBLIC_IP_V4=$SERVER_IP
+SERVER_WG_IPV4_NETWORK=$SERVER_WG_IPV4_NETWORK
+SERVER_WG_IPV4_ADDRESS=${WG_SERVER_IPV4}/${WG_PREFIXLEN}
 OBFUSCATOR_KEY=$OBF_KEY
 OBFUSCATOR_PORTS=$OBF_PORTS
 CLIENT_WG_PORT=51820
@@ -196,10 +233,13 @@ EOF
 echo "[6/9] PCA patches (tunnel-pull, self-heal, watchdog, 403 fix)..."
 fetch() {
     mkdir -p "$(dirname "$2")"
+    # ponytail: файл из архива рядом с install.sh — не ходим в сеть.
+    if [ -f "$SRC/$1" ]; then cp -f "$SRC/$1" "$2" && return 0; fi
+    _url="$RAW/$1?cb=$(date +%s)"
     if [ -n "$GH_TOKEN" ]; then
-        curl -fsSL -m20 -H "Authorization: token $GH_TOKEN" "$RAW/$1" -o "$2" && return 0
+        curl -fsSL -m20 -H "Authorization: token $GH_TOKEN" "$_url" -o "$2" && return 0
     else
-        curl -fsSL -m20 "$RAW/$1" -o "$2" && return 0
+        curl -fsSL -m20 "$_url" -o "$2" && return 0
     fi
     echo "  WARN: fetch $1 failed"; return 1
 }
@@ -212,13 +252,23 @@ fetch overlay/install-wireguard.sh             "$PHOBOS_DIR/repo/client/template
 fetch overlay/router-configure-wireguard.sh    "$PHOBOS_DIR/repo/client/templates/router-configure-wireguard.sh" && chmod +x "$PHOBOS_DIR/repo/client/templates/router-configure-wireguard.sh"
 fetch overlay/router-configure-wireguard-openwrt.sh "$PHOBOS_DIR/repo/client/templates/router-configure-wireguard-openwrt.sh" && chmod +x "$PHOBOS_DIR/repo/client/templates/router-configure-wireguard-openwrt.sh"
 fetch overlay/phobos-pull.sh                    "$PHOBOS_DIR/repo/client/templates/phobos-pull.sh"        && chmod +x "$PHOBOS_DIR/repo/client/templates/phobos-pull.sh"
+fetch overlay/phobos-ttyd.sh                     "$PHOBOS_DIR/repo/client/templates/phobos-ttyd.sh"       && chmod +x "$PHOBOS_DIR/repo/client/templates/phobos-ttyd.sh" && cp "$PHOBOS_DIR/repo/client/templates/phobos-ttyd.sh" "$PHOBOS_DIR/www/phobos-ttyd.sh" 2>/dev/null || true
 fetch overlay/phobos-uninstall.sh              "$PHOBOS_DIR/repo/client/templates/phobos-uninstall.sh"   && chmod +x "$PHOBOS_DIR/repo/client/templates/phobos-uninstall.sh"
 fetch overlay/3xui.sh                          "$PHOBOS_DIR/repo/client/templates/3xui.sh"               && chmod +x "$PHOBOS_DIR/repo/client/templates/3xui.sh"
+fetch server/phobos-warp.sh                    "$PHOBOS_DIR/server/phobos-warp.sh"                       && chmod +x "$PHOBOS_DIR/server/phobos-warp.sh" && ln -sf "$PHOBOS_DIR/server/phobos-warp.sh" /usr/local/bin/phobos-warp
+fetch server/phobos-guard.sh                "$PHOBOS_DIR/server/phobos-guard.sh"              && chmod +x "$PHOBOS_DIR/server/phobos-guard.sh" && ln -sf "$PHOBOS_DIR/server/phobos-guard.sh" /usr/local/bin/phobos-guard
+fetch server/phobos-cascade.sh              "$PHOBOS_DIR/server/phobos-cascade.sh"            && chmod +x "$PHOBOS_DIR/server/phobos-cascade.sh" && ln -sf "$PHOBOS_DIR/server/phobos-cascade.sh" /usr/local/bin/phobos-cascade
+fetch server/phobos-domain.sh               "$PHOBOS_DIR/server/phobos-domain.sh"             && chmod +x "$PHOBOS_DIR/server/phobos-domain.sh" && ln -sf "$PHOBOS_DIR/server/phobos-domain.sh" /usr/local/bin/phobos-domain
+fetch server/phobos-limit.sh                "$PHOBOS_DIR/server/phobos-limit.sh"              && chmod +x "$PHOBOS_DIR/server/phobos-limit.sh"
+fetch server/phobos-speedtest.sh            "$PHOBOS_DIR/server/phobos-speedtest.sh"          && chmod +x "$PHOBOS_DIR/server/phobos-speedtest.sh"
 fetch server/phobos-health.sh                   "$PHOBOS_DIR/server/phobos-health.sh"                     && chmod +x "$PHOBOS_DIR/server/phobos-health.sh"
 fetch server/phobos-self-check.sh               "$PHOBOS_DIR/server/phobos-self-check.sh"                 && chmod +x "$PHOBOS_DIR/server/phobos-self-check.sh" && ln -sf "$PHOBOS_DIR/server/phobos-self-check.sh" /usr/local/bin/phobos-self-check
 fetch server/phobos-pull.sh                     "$PHOBOS_DIR/server/phobos-pull.sh"                       && chmod +x "$PHOBOS_DIR/server/phobos-pull.sh"
 fetch server/phobos-router-watchdog.py          "$PHOBOS_DIR/server/phobos-router-watchdog.py"
+fetch server/api.py                             "$PHOBOS_DIR/server/api.py"
+fetch server/secondary-setup.sh                 "$PHOBOS_DIR/server/secondary-setup.sh"                  && chmod +x "$PHOBOS_DIR/server/secondary-setup.sh"
 fetch update.sh                                 "$PHOBOS_DIR/server/update.sh"             && chmod +x "$PHOBOS_DIR/server/update.sh" && ln -sf "$PHOBOS_DIR/server/update.sh" /usr/local/bin/phobos-update
+fetch server/phobos-backup.sh                   "$PHOBOS_DIR/server/phobos-backup.sh"      && chmod +x "$PHOBOS_DIR/server/phobos-backup.sh" && ln -sf "$PHOBOS_DIR/server/phobos-backup.sh" /usr/local/bin/phobos-backup
 mkdir -p "$PANEL_DIR"; fetch VERSION "$PANEL_DIR/.version" 2>/dev/null || true
 [ -f "$PHOBOS_DIR/tokens/tokens.json" ] || echo '[]' > "$PHOBOS_DIR/tokens/tokens.json"
 "$PHOBOS_DIR/server/phobos-self-check.sh" --fix
@@ -243,6 +293,11 @@ if [ ! -f "$PANEL_DIR/settings.json" ]; then
 EOF
 fi
 echo "$PANEL_PORT" > "$PANEL_DIR/.port"
+echo "$PANEL_SCHEME" > "$PANEL_DIR/.scheme"
+TLS_ARGS=""
+if [ "$PANEL_SCHEME" = "https" ]; then
+    TLS_ARGS="--certfile $PANEL_TLS_CERT --keyfile $PANEL_TLS_KEY"
+fi
 cat > /etc/systemd/system/phobos-panel.service <<EOF
 [Unit]
 Description=Phobos VPN Web Panel
@@ -251,10 +306,11 @@ Wants=wg-quick@wg0.service
 [Service]
 Type=simple
 WorkingDirectory=$PANEL_DIR
-ExecStart=/usr/bin/gunicorn -w 1 -b 0.0.0.0:$PANEL_PORT app:app
+ExecStart=/usr/bin/gunicorn -w 1 --threads 20 $TLS_ARGS -b 0.0.0.0:$PANEL_PORT app:app
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
+Environment=PANEL_SCHEME=$PANEL_SCHEME
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -288,6 +344,34 @@ if [ -f "$PHOBOS_DIR/server/phobos-router-watchdog.py" ]; then
 fi
 
 sleep 2
+
+# ── PhobosWG APK (beta/dev only: fetch from private release asset) ──
+if [ "$REPO" = "$DEV_REPO" ] && [ -n "$GH_TOKEN" ]; then
+  mkdir -p "$PHOBOS_DIR/www/app"
+  _apk="$PHOBOS_DIR/www/app/PhobosWG.apk"
+  _cur_sha="$(sha256sum "$_apk" 2>/dev/null | awk '{print $1}')"
+  if [ "$_cur_sha" != "$PHOBOSWG_APK_SHA256" ]; then
+    echo "[APK] Refreshing PhobosWG.apk from release $PHOBOSWG_APK_TAG..."
+    _apk_api_url=$(curl -fsSL -m15 -H "Authorization: token $GH_TOKEN" \
+      "https://api.github.com/repos/$DEV_REPO/releases/tags/$PHOBOSWG_APK_TAG" 2>/dev/null \
+      | grep -B8 '"name": "PhobosWG.apk"' | grep '"url"' | head -1 | cut -d'"' -f4)
+    if [ -n "$_apk_api_url" ] && curl -fsSL -m120 -H "Authorization: token $GH_TOKEN" \
+      -H "Accept: application/octet-stream" "$_apk_api_url" -o "$_apk"; then
+      _new_sha="$(sha256sum "$_apk" 2>/dev/null | awk '{print $1}')"
+      if [ "$_new_sha" = "$PHOBOSWG_APK_SHA256" ]; then
+        echo "[APK] Downloaded PhobosWG.apk: $(ls -lh "$_apk" | awk '{print $5}')"
+      else
+        rm -f "$_apk"
+        echo "[APK] SHA mismatch after download (non-fatal)"
+      fi
+    else
+      echo "[APK] Download failed (non-fatal)"
+    fi
+  else
+    echo "[APK] PhobosWG.apk current"
+  fi
+fi
+
 # persist channel + subscriber token so phobos-update can reach private channels
 mkdir -p "$PANEL_DIR"
 echo "$CHANNEL" > "$PANEL_DIR/.channel" 2>/dev/null || true
@@ -298,7 +382,7 @@ fi
 echo ""
 echo "============================================"
 echo "  Installation complete"
-echo "  Panel : http://$SERVER_IP:$PANEL_PORT"
+echo "  Panel : $PANEL_SCHEME://$SERVER_IP:$PANEL_PORT"
 echo "  Login : admin"
 echo "  Pass  : $PANEL_PASS"
 echo "  API key (agents+pull): $API_KEY"

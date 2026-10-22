@@ -4,8 +4,8 @@
 #  Deploys WG + obfuscator + mini-API (no web panel)
 #
 #  Usage:
-#    MAIN_SERVER=212.118.52.193 MAIN_PORT=10514 MAIN_API_KEY=secret123 \
-#    bash <(curl -fsSL https://raw.githubusercontent.com/andrey271192/PCA_Phobos/main/server/secondary-setup.sh)
+#    MAIN_PROTO=http MAIN_SERVER=203.0.113.10 MAIN_PORT=10514 MAIN_API_KEY=secret123 \
+#    bash <(curl -fsSL http://203.0.113.10:10514/server/secondary-setup.sh)
 #
 #  Uninstall:
 #    bash /opt/Phobos/server/phobos-secondary-uninstall.sh
@@ -15,13 +15,27 @@ set -e
 
 MAIN_SERVER="${MAIN_SERVER:?Set MAIN_SERVER=ip_of_main_server}"
 MAIN_API_KEY="${MAIN_API_KEY:?Set MAIN_API_KEY=your_api_key}"
+MAIN_PROTO="${MAIN_PROTO:-http}"
 MAIN_PORT="${MAIN_PORT:-8443}"
 OBF_PORTS="${OBF_PORTS:-2083,5443,993}"
+SERVER_WG_IPV4_NETWORK="${SERVER_WG_IPV4_NETWORK:-10.25.0.0/16}"
 PHOBOS_DIR="/opt/Phobos"
+WG_SERVER_IPV4="$(python3 - "$SERVER_WG_IPV4_NETWORK" <<'PY'
+import ipaddress, sys
+net = ipaddress.ip_network(sys.argv[1], strict=False)
+print(next(net.hosts()))
+PY
+)"
+WG_PREFIXLEN="$(python3 - "$SERVER_WG_IPV4_NETWORK" <<'PY'
+import ipaddress, sys
+print(ipaddress.ip_network(sys.argv[1], strict=False).prefixlen)
+PY
+)"
 
-SERVER_IP=$(curl -s https://api.ipify.org || hostname -I | awk '{print $1}')
+SERVER_IP="${SERVER_IP:-$(curl -s https://api.ipify.org || hostname -I | awk '{print $1}')}"
 IFACE=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1)}' | head -1)
 IFACE="${IFACE:-eth0}"
+case "$MAIN_PROTO" in http|https) ;; *) echo "ERROR: MAIN_PROTO must be http or https"; exit 1;; esac
 
 # ── Pre-flight safety checks ──
 echo ""
@@ -31,6 +45,7 @@ echo "╠═══════════════════════�
 echo "║  Server IP   : $SERVER_IP"
 echo "║  Interface   : $IFACE"
 echo "║  Main server : $MAIN_SERVER"
+echo "║  Main proto  : $MAIN_PROTO"
 echo "║  Main port   : $MAIN_PORT"
 echo "║  OBF ports   : $OBF_PORTS"
 echo "╚══════════════════════════════════════════════════════╝"
@@ -106,7 +121,7 @@ if [ "$WARNINGS" -gt 0 ]; then
     echo ""
     echo "Found $WARNINGS warning(s). Existing configs will be preserved where possible."
     echo "Press Enter to continue or Ctrl+C to abort..."
-    read -r < /dev/tty 2>/dev/null || true
+    [ -t 0 ] && read -r < /dev/tty 2>/dev/null || true
 fi
 
 echo ""
@@ -128,7 +143,7 @@ fi
 # ── 1. Dependencies ──
 echo "[1/7] Installing dependencies..."
 apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wireguard jq curl python3 python3-flask gunicorn 2>/dev/null
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wireguard wireguard-tools iptables jq curl git ca-certificates python3 python3-flask gunicorn 2>/dev/null
 
 # ── 2. Phobos binaries ──
 echo "[2/7] Getting Phobos binaries..."
@@ -193,7 +208,7 @@ else
 
     cat > /etc/wireguard/wg0.conf << WGEOF
 [Interface]
-Address = 10.25.0.1/16
+Address = ${WG_SERVER_IPV4}/${WG_PREFIXLEN}
 ListenPort = 51820
 PrivateKey = $WG_PRIV
 PostUp = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o $IFACE -j MASQUERADE
@@ -259,9 +274,12 @@ cat > "$PHOBOS_DIR/server/server.env" << EOF
 SERVER_WG_PRIVATE_KEY=$WG_PRIV
 SERVER_WG_PUBLIC_KEY=$WG_PUB
 SERVER_PUBLIC_IP_V4=$SERVER_IP
+SERVER_WG_IPV4_NETWORK=$SERVER_WG_IPV4_NETWORK
+SERVER_WG_IPV4_ADDRESS=${WG_SERVER_IPV4}/${WG_PREFIXLEN}
 OBFUSCATOR_KEY=$OBF_KEY
 OBFUSCATOR_PORTS=$OBF_PORTS
 MAIN_SERVER=$MAIN_SERVER
+MAIN_PROTO=$MAIN_PROTO
 MAIN_API_KEY=$MAIN_API_KEY
 MAIN_PORT=$MAIN_PORT
 ROLE=secondary
@@ -269,13 +287,17 @@ EOF
 
 # ── 6. Mini-API ──
 echo "[6/7] Setting up mini-API..."
-# Mini-API (fetched from PCA — includes /api/router-config for tunnel pull)
+# Mini-API (fetched from the main panel first, then PCA GitHub fallback)
 PCA_BRANCH="${PCA_BRANCH:-main}"
-RAW="https://raw.githubusercontent.com/andrey271192/PCA_Phobos/${PCA_BRANCH}"
-if [ -n "${GH_TOKEN:-}" ]; then
-    curl -fsSL -H "Authorization: token $GH_TOKEN" "$RAW/server/api.py" -o "$PHOBOS_DIR/server/api.py"
-else
-    curl -fsSL "$RAW/server/api.py" -o "$PHOBOS_DIR/server/api.py"
+PCA_REPO="${PCA_REPO:-andrey271192/PCA_Phobos}"
+RAW="${PCA_RAW_BASE:-https://raw.githubusercontent.com/${PCA_REPO}/${PCA_BRANCH}}"
+PANEL_BOOTSTRAP="${MAIN_PROTO}://${MAIN_SERVER}:${MAIN_PORT}/server/api.py"
+if ! curl -kfsSL "$PANEL_BOOTSTRAP" -o "$PHOBOS_DIR/server/api.py"; then
+    if [ -n "${GH_TOKEN:-}" ]; then
+        curl -fsSL -H "Authorization: token $GH_TOKEN" "$RAW/server/api.py" -o "$PHOBOS_DIR/server/api.py"
+    else
+        curl -fsSL "$RAW/server/api.py" -o "$PHOBOS_DIR/server/api.py"
+    fi
 fi
 [ -s "$PHOBOS_DIR/server/api.py" ] || { echo "ERROR: api.py fetch failed"; exit 1; }
 
@@ -322,7 +344,7 @@ echo ""
 echo "Backups (if any) in $PHOBOS_DIR/backup/ will be KEPT."
 echo ""
 echo "Press Enter to continue or Ctrl+C to abort..."
-read -r < /dev/tty 2>/dev/null || true
+[ -t 0 ] && read -r < /dev/tty 2>/dev/null || true
 
 echo "Stopping services..."
 # Stop obfuscator instances
@@ -398,7 +420,7 @@ REG_DATA=$(cat << EOF
 }
 EOF
 )
-curl -s -X POST "http://${MAIN_SERVER}:${MAIN_PORT}/api/servers/register" \
+curl -ks -X POST "${MAIN_PROTO}://${MAIN_SERVER}:${MAIN_PORT}/api/servers/register" \
     -H "Content-Type: application/json" \
     -H "X-API-Key: ${MAIN_API_KEY}" \
     -d "$REG_DATA" || echo "   (Registration will be done manually via panel)"

@@ -6,7 +6,7 @@ Wants=wg-quick@wg0.service
 [Service]
 Type=simple
 WorkingDirectory=/opt/phobos-panel
-ExecStart=/usr/bin/gunicorn -w 1 -b 0.0.0.0:8443 app:app
+ExecStart=/usr/bin/gunicorn -w 1 --threads 20 -b 0.0.0.0:8443 app:app
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1

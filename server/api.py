@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Phobos Secondary Server API — peer management + health."""
-import json, os, subprocess
+import json, os, subprocess, time, hmac
+from pathlib import Path
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
@@ -17,7 +18,50 @@ def load_env():
 def check_api_key():
     env = load_env()
     key = request.headers.get("X-API-Key", "")
-    return key == env.get("MAIN_API_KEY", "")
+    return hmac.compare_digest(key, env.get("MAIN_API_KEY", ""))
+
+
+def default_iface():
+    try:
+        out = subprocess.check_output(["ip", "route", "get", "8.8.8.8"], text=True, timeout=4)
+        parts = out.split()
+        for i, part in enumerate(parts[:-1]):
+            if part == "dev":
+                return parts[i + 1].strip()
+    except Exception:
+        pass
+    return ""
+
+
+def cpu_percent():
+    try:
+        with open("/proc/stat") as fh:
+            a = fh.readline().split()[1:]
+        time.sleep(0.1)
+        with open("/proc/stat") as fh:
+            b = fh.readline().split()[1:]
+        a = [int(x) for x in a]
+        b = [int(x) for x in b]
+        idle = b[3] - a[3]
+        total = sum(b) - sum(a)
+        if total <= 0:
+            return "?"
+        return f"{round(100 - (idle * 100.0 / total), 1)}%"
+    except Exception:
+        return "?"
+
+def net_bytes():
+    try:
+        iface = default_iface()
+        with open("/proc/net/dev") as fh:
+            for line in fh:
+                if line.split(":")[0].strip() == iface:
+                    p = line.split(":")[1].split()
+                    return {"iface": iface, "rx": int(p[0]), "tx": int(p[8]), "ts": int(time.time())}
+    except Exception:
+        pass
+    return {}
+
 
 @app.route("/api/health")
 def health():
@@ -39,18 +83,45 @@ def health():
         peers = 0
         peer_keys = []
         handshakes = {}
+    cpu = cpu_percent()
     try:
-        out = subprocess.check_output("top -bn1 | grep Cpu", shell=True, text=True, timeout=5)
-        idle = float([x for x in out.split(",") if "id" in x][0].split()[0])
-        cpu = f"{round(100 - idle, 1)}%"
-    except Exception:
-        cpu = "?"
-    try:
-        mem = subprocess.check_output("free -m", shell=True, text=True).split("\n")[1].split()
-        mem_str = f"{mem[2]}/{mem[1]}MB"
+        parts = Path("/proc/meminfo").read_text().splitlines()
+        vals = {}
+        for line in parts:
+            k, v = line.split(":", 1)
+            vals[k] = int(v.strip().split()[0])
+        total = vals.get("MemTotal", 0) // 1024
+        avail = vals.get("MemAvailable", 0) // 1024
+        used = max(total - avail, 0)
+        mem_str = f"{used}/{total}MB"
     except Exception:
         mem_str = "?"
-    return jsonify({"status": "ok", "peers": peers, "peer_keys": peer_keys, "handshakes": handshakes, "cpu": cpu, "mem": mem_str})
+    return jsonify({"status": "ok", "peers": peers, "peer_keys": peer_keys, "handshakes": handshakes, "cpu": cpu, "mem": mem_str, "net": net_bytes()})
+
+
+@app.route("/api/obf-health")
+def obf_health():
+    """Return 200 only when all local wg-obfuscator-* services are active."""
+    try:
+        listing = subprocess.check_output(
+            ["systemctl", "list-units", "--type=service", "--no-legend",
+             "wg-obfuscator-*"], text=True, timeout=5)
+        names = [ln.split()[0] for ln in listing.splitlines() if ln.strip()]
+    except Exception:
+        names = []
+    if not names:
+        env = load_env()
+        ports = [p.strip() for p in env.get("OBFUSCATOR_PORTS", "2083,5443,993").split(",") if p.strip()]
+        names = [f"wg-obfuscator-{p}.service" for p in ports]
+    bad = []
+    for name in names:
+        status = subprocess.getoutput("systemctl is-active " + name).strip()
+        if status != "active":
+            bad.append(name + "=" + status)
+    if bad:
+        return ("obf-down: " + ",".join(bad), 503, {"Content-Type": "text/plain"})
+    return ("obf-ok " + str(len(names)), 200, {"Content-Type": "text/plain"})
+
 
 @app.route("/api/peers", methods=["GET"])
 def list_peers():
@@ -67,11 +138,54 @@ def list_peers():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
+LIMIT_SCRIPT = "/opt/Phobos/server/phobos-limit.sh"
+
+
+def ensure_script(path):
+    """Fetch a helper script from the main panel if this agent predates it."""
+    if os.path.exists(path):
+        return
+    env = load_env()
+    url = "%s://%s:%s/server/%s" % (env.get("MAIN_PROTO", "http"), env.get("MAIN_SERVER", ""),
+                                    env.get("MAIN_PORT", ""), os.path.basename(path))
+    subprocess.run(["curl", "-kfsSL", "-m", "20", url, "-o", path], timeout=30)
+    if os.path.exists(path):
+        os.chmod(path, 0o755)
+
+
+@app.route("/api/speedtest", methods=["POST"])
+def speedtest():
+    if not check_api_key():
+        return jsonify({"error": "unauthorized"}), 401
+    path = "/opt/Phobos/server/phobos-speedtest.sh"
+    ensure_script(path)
+    try:
+        r = subprocess.run([path], capture_output=True, text=True, timeout=80)
+        return jsonify(json.loads(r.stdout.strip().splitlines()[-1]))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/limits", methods=["POST"])
+def set_limits():
+    """Per-client speed limits pushed by the main panel ("<tunnel_ip> <mbit>" lines)."""
+    if not check_api_key():
+        return jsonify({"error": "unauthorized"}), 401
+    text = (request.get_json(force=True, silent=True) or {}).get("limits", "")
+    Path("/opt/Phobos/server/limits.conf").write_text(text)
+    ensure_script(LIMIT_SCRIPT)
+    try:
+        r = subprocess.run([LIMIT_SCRIPT, "apply"], capture_output=True, text=True, timeout=30)
+        return jsonify({"status": "ok" if r.returncode == 0 else "error", "out": (r.stdout + r.stderr)[-500:]})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/api/peers/add", methods=["POST"])
 def add_peer():
     if not check_api_key():
         return jsonify({"error": "unauthorized"}), 401
-    data = request.json
+    data = request.get_json(force=True, silent=True) or {}
     pub_key = data.get("public_key", "")
     allowed_ips = data.get("allowed_ips", "")
     if not pub_key or not allowed_ips:
@@ -87,7 +201,8 @@ def add_peer():
 def remove_peer():
     if not check_api_key():
         return jsonify({"error": "unauthorized"}), 401
-    pub_key = request.json.get("public_key", "")
+    data = request.get_json(force=True, silent=True) or {}
+    pub_key = data.get("public_key", "")
     if not pub_key:
         return jsonify({"error": "missing public_key"}), 400
     try:
@@ -116,7 +231,7 @@ ROUTER_CONFIGS_DIR = "/opt/Phobos/server/router-configs"
 @app.route("/api/router-config/<client_id>")
 def router_config(client_id):
     """Serve a client's failover.conf so routers can PULL via the tunnel
-    (http://10.25.0.1:8444/...). Token via ?token= or X-API-Key."""
+    (http://<server-tunnel-ip>:8444/...). Token via ?token= or X-API-Key."""
     token = request.args.get("token", "") or request.headers.get("X-API-Key", "")
     if token != load_env().get("MAIN_API_KEY", ""):
         return ("forbidden", 403)
