@@ -137,8 +137,8 @@ bash <(curl -fsSL https://git.bobyrev.com/PCA/PCA_Phobos/raw/branch/main/server/
 
 ## Приложения для Android
 
-- **PCA Phobos VPN** — клиент: включает VPN одной кнопкой, импорт `phobos://` из панели, встроенный обфускатор, **раздельный трафик** (весь / только выбранные приложения / все кроме выбранных), **российские сайты напрямую** (по умолчанию), **канал Авто/UDP/TCP** (при блокировке UDP — сам на TCP), журнал, проверка скорости. [Скачать APK](https://git.bobyrev.com/PCA/PCA_Phobos/releases/download/v1.4.1/PCA-Phobos-VPN.apk) · исходники `android-client/`.
-- **PCA Phobos** (админ) — список ваших панелей, открываются в приложении. [Скачать APK](https://git.bobyrev.com/PCA/PCA_Phobos/releases/download/v1.4.1/PCA-Phobos.apk) · исходники `android/`.
+- **PCA Phobos VPN** — клиент: включает VPN одной кнопкой, импорт `phobos://` из панели, встроенный обфускатор, **раздельный трафик** (весь / только выбранные приложения / все кроме выбранных), **российские сайты напрямую** (по умолчанию), **канал Авто/UDP/TCP** (при блокировке UDP — сам на TCP), журнал, проверка скорости. [Скачать APK](https://git.bobyrev.com/PCA/PCA_Phobos/releases/download/v1.4.2/PCA-Phobos-VPN.apk) · исходники `android-client/`.
+- **PCA Phobos** (админ) — список ваших панелей, открываются в приложении. [Скачать APK](https://git.bobyrev.com/PCA/PCA_Phobos/releases/download/v1.4.2/PCA-Phobos.apk) · исходники `android/`.
 
 ## Клиенты для телефона
 

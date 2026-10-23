@@ -217,11 +217,16 @@ public class MainActivity extends Activity {
 
     private static String getPackageNameSafe() { return "com.pca.phobos.vpn"; }
 
+    private static final java.util.Set<String> OBF_KEYS = new java.util.HashSet<>(java.util.Arrays.asList(
+            "target", "key", "masking", "idle-timeout", "max-dummy", "static-bindings", "max-clients", "target-if", "allow-clean", "in-timeout", "resolve-interval"));
+
     private String obfPart(String conf, boolean viaTcp) {
         StringBuilder sb = new StringBuilder("[instance]\nsource-if = 127.0.0.1\nsource-lport = " + LPORT + "\n");
         for (String ln : section(conf, "[instance]")) {
             String k = key(ln);
             if (k.equals("source-if") || k.equals("source-lport") || k.equals("verbose")) continue;
+            // configs from other Phobos builds carry keys our wg-obfuscator v1.6 rejects (obfuscate-bytes…)
+            if (!OBF_KEYS.contains(k)) continue;
             if (viaTcp && k.equals("target")) ln = "target = 127.0.0.1:" + TCP_LPORT;
             sb.append(ln).append('\n');
         }

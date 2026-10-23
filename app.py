@@ -37,7 +37,7 @@ WG_CONFIG = "/etc/wireguard/wg0.conf"
 # Distribution: Gitea first (GitHub account is unavailable since 23.10.2026), GitHub fallback
 PCA_GIT = "https://git.bobyrev.com/PCA/PCA_Phobos"
 PCA_GH_RAW = "https://raw.githubusercontent.com/andrey271192/PCA_Phobos"
-APK_TAG = "v1.4.1"
+APK_TAG = "v1.4.2"
 WARP_DIR = f"{PHOBOS_DIR}/server/warp"
 WARP_CUSTOM_PROFILE_FILE = f"{WARP_DIR}/custom-profile.conf"
 WARP_LICENSE_FILE = f"{WARP_DIR}/license.key"
@@ -100,6 +100,44 @@ def save_settings(s):
     with _settings_lock:
         with open(SETTINGS_FILE, "w") as f:
             json.dump(s, f, indent=2, ensure_ascii=False)
+
+
+SRV_OBF_KEYS = ("masking", "max-dummy", "idle-timeout")
+
+
+def _srv_obf_confs():
+    import glob
+    return sorted(glob.glob(f"{PHOBOS_DIR}/server/wg-obfuscator-*.conf"))
+
+
+def read_server_obf():
+    """Current server wg-obfuscator params (from the first instance config)."""
+    vals = {"masking": "AUTO", "max-dummy": "50", "idle-timeout": "300"}
+    confs = _srv_obf_confs()
+    if confs:
+        for ln in Path(confs[0]).read_text().splitlines():
+            k, _, v = ln.partition("=")
+            if k.strip() in SRV_OBF_KEYS:
+                vals[k.strip()] = v.strip()
+    return vals
+
+
+def write_server_obf(vals):
+    """Rewrite masking/max-dummy/idle-timeout in every server instance and restart them."""
+    done = []
+    for f in _srv_obf_confs():
+        lines, seen = [], set()
+        for ln in Path(f).read_text().splitlines():
+            k = ln.partition("=")[0].strip()
+            if k in vals:
+                ln = f"{k} = {vals[k]}"; seen.add(k)
+            lines.append(ln)
+        lines += [f"{k} = {v}" for k, v in vals.items() if k not in seen]
+        Path(f).write_text("\n".join(lines) + "\n")
+        port = re.search(r"wg-obfuscator-(\d+)\.conf$", f).group(1)
+        subprocess.run(["systemctl", "restart", f"wg-obfuscator-{port}"], timeout=30)
+        done.append(port)
+    return done
 
 
 def _load_server_env():
@@ -2741,6 +2779,17 @@ def settings_page():
             except Exception:
                 pass
         msg = f'<div class="alert alert-ok">{tr("Параметры обфускатора сохранены и отправлены на роутеры", "Obfuscator params saved and pushed to routers")} ({pushed})</div>'
+    elif request.method == "POST" and request.form.get("action") == "save_srv_obf":
+        masking = request.form.get("srv_masking", "AUTO").strip().upper()
+        if masking not in ("AUTO", "STUN", "NONE"):
+            masking = "AUTO"
+        try:
+            dummy = str(min(255, max(0, int(request.form.get("srv_max_dummy", "50")))))
+            idle = str(min(3600, max(10, int(request.form.get("srv_idle", "300")))))
+        except ValueError:
+            dummy, idle = "50", "300"
+        ports = write_server_obf({"masking": masking, "max-dummy": dummy, "idle-timeout": idle})
+        msg = f'<div class="alert alert-ok">{tr("Серверный обфускатор перезапущен с новыми параметрами, порты", "Server obfuscator restarted with new params, ports")}: {", ".join(ports) or "—"}</div>'
     elif request.method == "POST":
         new_pass = request.form.get("admin_pass", "").strip()
         if new_pass:
@@ -2758,6 +2807,7 @@ def settings_page():
     custom_warp_profile = read_custom_warp_profile()
     warp_license_key = read_warp_license_key()
     warp = warp_status()
+    srv_obf = read_server_obf()
     warp_service = warp.get("service", "unknown")
     warp_state = tr("включён", "enabled") if warp.get("enabled") else tr("выключен", "disabled")
     warp_subnet = _html_attr(warp.get("subnet", server_wg_network()))
@@ -2895,6 +2945,20 @@ def settings_page():
       <label>max-dummy <input type="number" name="obf_max_dummy" value="{s.get('obf_params',{}).get('max_dummy','4')}" min="0" max="255" style="width:70px;padding:5px"></label>
       <label>idle (s) <input type="number" name="obf_idle" value="{s.get('obf_params',{}).get('idle','300')}" min="10" max="3600" style="width:80px;padding:5px"></label>
       <button class="btn btn-primary btn-sm" type="submit">{tr("Сохранить и отправить","Save & push")}</button>
+    </form>
+    </div>
+
+    <div class="card">
+    <h2>{tr("Обфускатор сервера","Server obfuscator")} {hlp("Параметры wg-obfuscator на ЭТОМ сервере (все порты). masking: AUTO принимает любой режим клиента — менять, только если знаете зачем; STUN/NONE — клиенты должны работать в том же режиме. max-dummy — мусорные байты в ответах, idle — таймаут простоя (сек). Сохранение перезапускает обфускатор: клиенты переподключатся за пару секунд.", "wg-obfuscator params on THIS server (all ports). masking: AUTO accepts any client mode — change only if you know why; with STUN/NONE clients must use the same mode. max-dummy — junk bytes in replies, idle — idle timeout (s). Saving restarts the obfuscator: clients reconnect within seconds.")}</h2>
+    <form method="post" class="form-row" style="flex-wrap:wrap;gap:10px;align-items:center" onsubmit="return confirm('{tr("Перезапустить обфускатор сервера? Клиенты переподключатся за пару секунд.","Restart server obfuscator? Clients will reconnect within seconds.")}')">
+      <input type="hidden" name="action" value="save_srv_obf">
+      <label>masking
+        <select name="srv_masking" style="background:var(--bg);border:1px solid var(--border);color:var(--text);padding:5px;border-radius:6px">
+          {"".join(f'<option value="{m}"{" selected" if srv_obf["masking"].upper()==m else ""}>{m}</option>' for m in ("AUTO","STUN","NONE"))}
+        </select></label>
+      <label>max-dummy <input type="number" name="srv_max_dummy" value="{_html_attr(srv_obf['max-dummy'])}" min="0" max="255" style="width:70px;padding:5px"></label>
+      <label>idle (s) <input type="number" name="srv_idle" value="{_html_attr(srv_obf['idle-timeout'])}" min="10" max="3600" style="width:80px;padding:5px"></label>
+      <button class="btn btn-primary btn-sm" type="submit">{tr("Сохранить и перезапустить","Save & restart")}</button>
     </form>
     </div>
 
