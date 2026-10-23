@@ -37,7 +37,7 @@ WG_CONFIG = "/etc/wireguard/wg0.conf"
 # Distribution: Gitea first (GitHub account is unavailable since 23.10.2026), GitHub fallback
 PCA_GIT = "https://git.bobyrev.com/PCA/PCA_Phobos"
 PCA_GH_RAW = "https://raw.githubusercontent.com/andrey271192/PCA_Phobos"
-APK_TAG = "v1.4.0"
+APK_TAG = "v1.4.1"
 WARP_DIR = f"{PHOBOS_DIR}/server/warp"
 WARP_CUSTOM_PROFILE_FILE = f"{WARP_DIR}/custom-profile.conf"
 WARP_LICENSE_FILE = f"{WARP_DIR}/license.key"
@@ -1390,6 +1390,10 @@ def build_phone_config(cid, mode="android"):
             ("target = " + _swap_host(ln.split("=", 1)[1].strip(), client_endpoint))
             if ln.strip().startswith("target") and "=" in ln else ln
             for ln in inst.split("\n"))
+        tcp_port = _load_server_env().get("TCP_PORT", "")
+        if tcp_port and "pca-tcp" not in inst:
+            # comment: PhobosWG/wg-obfuscator ignore it, PCA Phobos VPN uses it for the TCP fallback
+            inst += "\n# pca-tcp = " + tcp_port
     conf = wg + "\n\n" + inst + "\n"
     payload = _prepare_phoboswg_payload(conf)
     b64 = base64.urlsafe_b64encode(payload.encode()).decode()

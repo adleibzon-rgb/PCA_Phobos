@@ -59,7 +59,9 @@ public class MainActivity extends Activity {
     static final String MODE_ALL = "all", MODE_ONLY = "only", MODE_EXCEPT = "except";
 
     static GoBackend backend;
-    static Process obfuscator;
+    static Process obfuscator, relay;
+    static final int TCP_LPORT = 13256;
+    static volatile String transport = "";      // "UDP" | "TCP" while up
     static final Tunnel TUNNEL = new Tunnel() {
         public String getName() { return "phobos"; }
         public void onStateChange(Tunnel.State s) { }
@@ -215,15 +217,25 @@ public class MainActivity extends Activity {
 
     private static String getPackageNameSafe() { return "com.pca.phobos.vpn"; }
 
-    private String obfPart(String conf) {
+    private String obfPart(String conf, boolean viaTcp) {
         StringBuilder sb = new StringBuilder("[instance]\nsource-if = 127.0.0.1\nsource-lport = " + LPORT + "\n");
         for (String ln : section(conf, "[instance]")) {
             String k = key(ln);
             if (k.equals("source-if") || k.equals("source-lport") || k.equals("verbose")) continue;
+            if (viaTcp && k.equals("target")) ln = "target = 127.0.0.1:" + TCP_LPORT;
             sb.append(ln).append('\n');
         }
         sb.append("verbose = INFO\n");
         return sb.toString();
+    }
+
+    /** "# pca-tcp = 443" written by the panel when the server has the TCP fallback. */
+    private static String tcpPort(String conf) {
+        for (String ln : conf.split("\n")) {
+            String t = ln.trim();
+            if (t.startsWith("#") && t.contains("pca-tcp") && t.contains("=")) return val(t);
+        }
+        return "";
     }
 
     private String target(String conf) {
@@ -250,24 +262,39 @@ public class MainActivity extends Activity {
         else if (req == 7) toast("Без разрешения на VPN подключиться нельзя");
     }
 
+    /** Start (or restart) obfuscator; via TCP it dials the local udptcp relay. */
+    private void startTransport(String conf, boolean viaTcp) throws Exception {
+        stopObfuscator();
+        String lib = getApplicationInfo().nativeLibraryDir;
+        if (viaTcp) {
+            String host = target(conf).replaceAll(":\\d+$", "");
+            relay = new ProcessBuilder(lib + "/libudptcp.so", "-c", "127.0.0.1:" + TCP_LPORT, host + ":" + tcpPort(conf))
+                    .redirectErrorStream(true).redirectOutput(new File(getFilesDir(), "tcp.log")).start();
+        }
+        File cfg = new File(getFilesDir(), "obf.conf");
+        try (FileOutputStream o = new FileOutputStream(cfg)) { o.write(obfPart(conf, viaTcp).getBytes(StandardCharsets.UTF_8)); }
+        obfuscator = new ProcessBuilder(lib + "/libwgobfuscator.so", "-c", cfg.getAbsolutePath())
+                .redirectErrorStream(true).redirectOutput(new File(getFilesDir(), "obf.log")).start();
+        Thread.sleep(600);
+        if (!obfuscator.isAlive()) throw new IllegalStateException("обфускатор завершился, код " + obfuscator.exitValue() + " — см. «Журнал»");
+        if (relay != null && !relay.isAlive()) throw new IllegalStateException("TCP-канал не запустился — см. «Журнал»");
+        transport = viaTcp ? "TCP" : "UDP";
+        log("transport " + transport + " -> " + target(conf) + (viaTcp ? " tcp:" + tcpPort(conf) : ""));
+    }
+
     private void up() {
         try {
             String conf = prefs.getString("conf", "");
-            File cfg = new File(getFilesDir(), "obf.conf");
-            try (FileOutputStream o = new FileOutputStream(cfg)) { o.write(obfPart(conf).getBytes(StandardCharsets.UTF_8)); }
-            stopObfuscator();
-            String bin = getApplicationInfo().nativeLibraryDir + "/libwgobfuscator.so";
-            obfuscator = new ProcessBuilder(bin, "-c", cfg.getAbsolutePath())
-                    .redirectErrorStream(true)
-                    .redirectOutput(new File(getFilesDir(), "obf.log"))
-                    .start();
-            Thread.sleep(600);
-            if (!obfuscator.isAlive()) throw new IllegalStateException("обфускатор завершился, код " + obfuscator.exitValue() + " — см. «Журнал»");
+            String mode = prefs.getString("transport", "auto");
+            boolean tcpAvail = !tcpPort(conf).isEmpty();
+            if ("tcp".equals(mode) && !tcpAvail) throw new IllegalStateException("на сервере нет TCP-канала — обновите панель и заново импортируйте ссылку");
+            startTransport(conf, "tcp".equals(mode));
             Config c = Config.parse(new BufferedReader(new StringReader(
                     wgPart(conf, prefs.getString("mode", MODE_ALL), prefs.getString("apps", "")))));
             backend.setState(TUNNEL, Tunnel.State.UP, c);
-            log("up ok, target " + target(conf) + ", mode " + prefs.getString("mode", MODE_ALL));
-            post("Подключено");
+            log("up ok, mode " + prefs.getString("mode", MODE_ALL) + ", transport " + mode);
+            post("Подключено (" + transport + ")");
+            if ("auto".equals(mode) && tcpAvail) watchUdp(conf);
         } catch (Throwable e) {
             stopObfuscator();
             log("up failed: " + e);
@@ -275,14 +302,30 @@ public class MainActivity extends Activity {
         }
     }
 
+    /** Auto: no bytes back over UDP within 15 s -> UDP is cut, move the obfuscator to TCP. */
+    private void watchUdp(String conf) {
+        new Thread(() -> {
+            try {
+                Thread.sleep(15000);
+                if (!isUp() || !"UDP".equals(transport)) return;
+                if (backend.getStatistics(TUNNEL).totalRx() > 0) return;
+                log("UDP: no answer in 15 s -> switching to TCP");
+                startTransport(conf, true);
+                post("UDP не отвечает — переключился на TCP");
+            } catch (Throwable e) { log("watchUdp: " + e); }
+        }).start();
+    }
+
     private void down() {
         try { backend.setState(TUNNEL, Tunnel.State.DOWN, null); } catch (Throwable ignored) { }
         stopObfuscator();
+        transport = "";
         post("Отключено");
     }
 
     private static void stopObfuscator() {
         if (obfuscator != null) { obfuscator.destroy(); obfuscator = null; }
+        if (relay != null) { relay.destroy(); relay = null; }
     }
 
     private void post(String msg) { ui.post(() -> { toast(msg); refresh(); }); }
@@ -364,6 +407,20 @@ public class MainActivity extends Activity {
         ru.setChecked(prefs.getBoolean("ru_direct", true));
         ru.setOnCheckedChangeListener((b, on) -> { prefs.edit().putBoolean("ru_direct", on).apply(); applyIfUp(); });
         split.addView(ru, mw(4));
+        split.addView(tv("Канал до сервера", text(), 14, true), mw(8));
+        RadioGroup tg = new RadioGroup(this);
+        tg.setOrientation(RadioGroup.HORIZONTAL);
+        String tmode = prefs.getString("transport", "auto");
+        for (String[] m : new String[][]{{"auto", "Авто"}, {"udp", "UDP"}, {"tcp", "TCP"}}) {
+            RadioButton r = new RadioButton(this);
+            r.setText(m[1]);
+            r.setTextColor(text());
+            r.setId(View.generateViewId());
+            r.setChecked(m[0].equals(tmode));
+            r.setOnClickListener(v -> { prefs.edit().putString("transport", m[0]).apply(); applyIfUp(); });
+            tg.addView(r);
+        }
+        split.addView(tg);
         int n = prefs.getString("apps", "").isEmpty() ? 0 : prefs.getString("apps", "").split(",").length;
         split.addView(button("Выбрать приложения (" + n + ")", 0xFF475569, v -> pickApps()), mw(8));
         split.addView(tv("Изменения применяются сразу. Само приложение всегда идёт напрямую — так обфускатор держит связь с сервером.",
@@ -385,7 +442,7 @@ public class MainActivity extends Activity {
         boolean up = isUp();
         power.setText(up ? "Отключить" : "Подключить");
         power.setBackground(round(up ? 0xFF16A34A : 0xFF4F46E5, 90));
-        status.setText(up ? "🟢 VPN включён" : "⚪ VPN выключен");
+        status.setText(up ? "🟢 VPN включён" + (transport.isEmpty() ? "" : " · " + transport) : "⚪ VPN выключен");
         if (up) {
             try {
                 Statistics st = backend.getStatistics(TUNNEL);
@@ -466,6 +523,7 @@ public class MainActivity extends Activity {
     private void showLog() {
         String t = "— приложение —\n" + tail(new File(getFilesDir(), "app.log"), 3000)
                 + "\n— обфускатор —\n" + tail(new File(getFilesDir(), "obf.log"), 3000)
+                + "\n— TCP-канал —\n" + tail(new File(getFilesDir(), "tcp.log"), 1500)
                 + "\nобфускатор запущен: " + (obfuscator != null && obfuscator.isAlive());
         TextView v = tv(t, text(), 12, false);
         v.setTextIsSelectable(true);

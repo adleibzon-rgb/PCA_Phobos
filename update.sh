@@ -86,8 +86,23 @@ $PHOBOS_DIR/server/phobos-cascade.sh|server/phobos-cascade.sh
 $PHOBOS_DIR/server/phobos-domain.sh|server/phobos-domain.sh
 $PHOBOS_DIR/server/phobos-limit.sh|server/phobos-limit.sh
 $PHOBOS_DIR/server/phobos-speedtest.sh|server/phobos-speedtest.sh
+$PHOBOS_DIR/server/phobos-tcp.sh|server/phobos-tcp.sh
 $PHOBOS_DIR/server/update.sh|update.sh
 LIST
+}
+
+ensure_tcp_fallback() {  # $1=ref ; primary only (secondaries have no panel)
+    [ -f "$PANEL_DIR/app.py" ] || return 0
+    local arch tmp
+    arch=$(uname -m); case "$arch" in amd64) arch=x86_64;; arm64) arch=aarch64;; esac
+    tmp=$(mktemp)
+    if fetch_repo_file "$1" "udptcp/bin/udptcp-$arch" "$tmp" && [ -s "$tmp" ]; then
+        install -m755 "$tmp" "$PHOBOS_DIR/bin/udptcp"
+    fi
+    rm -f "$tmp"
+    [ -x "$PHOBOS_DIR/server/phobos-tcp.sh" ] && ln -sf "$PHOBOS_DIR/server/phobos-tcp.sh" /usr/local/bin/phobos-tcp
+    [ -x "$PHOBOS_DIR/bin/udptcp" ] && "$PHOBOS_DIR/server/phobos-tcp.sh" enable >/dev/null 2>&1 \
+        && echo "TCP fallback: port $(grep '^TCP_PORT=' "$PHOBOS_DIR/server/server.env" | cut -d= -f2)" || true
 }
 
 run_self_check() {
@@ -251,6 +266,7 @@ case "${1:-}" in
     apply_ref "$ref"
     ensure_runtime_deps
     run_self_check
+    ensure_tcp_fallback "$ref"
     refresh_router_packages
     echo "$target" > "$VERFILE"
     restart_panel_service

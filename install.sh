@@ -243,6 +243,8 @@ fetch server/phobos-cascade.sh              "$PHOBOS_DIR/server/phobos-cascade.s
 fetch server/phobos-domain.sh               "$PHOBOS_DIR/server/phobos-domain.sh"             && chmod +x "$PHOBOS_DIR/server/phobos-domain.sh" && ln -sf "$PHOBOS_DIR/server/phobos-domain.sh" /usr/local/bin/phobos-domain
 fetch server/phobos-limit.sh                "$PHOBOS_DIR/server/phobos-limit.sh"              && chmod +x "$PHOBOS_DIR/server/phobos-limit.sh"
 fetch server/phobos-speedtest.sh            "$PHOBOS_DIR/server/phobos-speedtest.sh"          && chmod +x "$PHOBOS_DIR/server/phobos-speedtest.sh"
+fetch server/phobos-tcp.sh                  "$PHOBOS_DIR/server/phobos-tcp.sh"                && chmod +x "$PHOBOS_DIR/server/phobos-tcp.sh" && ln -sf "$PHOBOS_DIR/server/phobos-tcp.sh" /usr/local/bin/phobos-tcp
+fetch "udptcp/bin/udptcp-$OBF_ARCH"         "$PHOBOS_DIR/bin/udptcp"                          && chmod +x "$PHOBOS_DIR/bin/udptcp"
 fetch server/phobos-health.sh                   "$PHOBOS_DIR/server/phobos-health.sh"                     && chmod +x "$PHOBOS_DIR/server/phobos-health.sh"
 fetch server/phobos-self-check.sh               "$PHOBOS_DIR/server/phobos-self-check.sh"                 && chmod +x "$PHOBOS_DIR/server/phobos-self-check.sh" && ln -sf "$PHOBOS_DIR/server/phobos-self-check.sh" /usr/local/bin/phobos-self-check
 fetch server/phobos-pull.sh                     "$PHOBOS_DIR/server/phobos-pull.sh"                       && chmod +x "$PHOBOS_DIR/server/phobos-pull.sh"
@@ -297,6 +299,9 @@ Environment=PANEL_SCHEME=$PANEL_SCHEME
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload; systemctl enable phobos-panel -q; systemctl restart phobos-panel
+
+# TCP fallback for clients whose UDP is cut (port 443/8443/... picked automatically)
+"$PHOBOS_DIR/server/phobos-tcp.sh" enable || echo "  WARN: TCP fallback not enabled"
 
 # ── 8. nginx (serve /init + /packages over plain HTTP for routers) ──
 echo "[8/9] nginx..."
