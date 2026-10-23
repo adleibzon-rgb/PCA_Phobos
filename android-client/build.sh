@@ -14,7 +14,7 @@ rm -rf build && mkdir -p build/res build/classes build/dex build/aar build/apk/l
 unzip -q "$AAR" -d build/aar
 LIBS="build/aar/classes.jar:$(ls libs/*.jar | tr '\n' ':')"
 "$BT/aapt2" compile --dir res -o build/res/
-"$BT/aapt2" link -o build/base.apk -I "$JAR" --manifest AndroidManifest.xml \
+"$BT/aapt2" link -o build/base.apk -I "$JAR" --manifest AndroidManifest.xml -A assets \
     --java build/gen build/res/*.flat --min-sdk-version 24 --target-sdk-version 35
 javac -source 11 -target 11 -nowarn -classpath "$JAR:$LIBS" -d build/classes \
     $(find src build/gen -name '*.java') 2>&1 | grep -v "bootstrap classpath\|^Note:" || true

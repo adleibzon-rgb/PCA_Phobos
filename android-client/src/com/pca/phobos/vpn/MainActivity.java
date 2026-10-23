@@ -190,11 +190,27 @@ public class MainActivity extends Activity {
             sb.append("ExcludedApplications = ").append(String.join(", ", ex)).append('\n');
         }
         sb.append("\n[Peer]\n");
+        String ruBypass = prefs != null && prefs.getBoolean("ru_direct", true) ? ruBypassAllowedIps() : null;
         for (String ln : section(conf, "[Peer]")) {
             if (key(ln).equals("endpoint")) ln = "Endpoint = 127.0.0.1:" + LPORT;
+            if (key(ln).equals("allowedips") && ruBypass != null) ln = "AllowedIPs = " + ruBypass;
             sb.append(ln).append('\n');
         }
         return sb.toString();
+    }
+
+    private String ruCache;
+
+    /** Internet minus Russian networks (assets/ru_bypass.txt, generated from ipdeny). */
+    private String ruBypassAllowedIps() {
+        if (ruCache != null) return ruCache;
+        try (BufferedReader r = new BufferedReader(new java.io.InputStreamReader(
+                getAssets().open("ru_bypass.txt"), StandardCharsets.UTF_8))) {
+            for (String ln; (ln = r.readLine()) != null; ) {
+                if (!ln.startsWith("#") && ln.contains("/")) { ruCache = ln.trim(); break; }
+            }
+        } catch (Exception e) { log("ru_bypass: " + e); }
+        return ruCache;
     }
 
     private static String getPackageNameSafe() { return "com.pca.phobos.vpn"; }
@@ -342,6 +358,12 @@ public class MainActivity extends Activity {
             rg.addView(r);
         }
         split.addView(rg);
+        android.widget.CheckBox ru = new android.widget.CheckBox(this);
+        ru.setText("Российские сайты — напрямую, без VPN");
+        ru.setTextColor(text());
+        ru.setChecked(prefs.getBoolean("ru_direct", true));
+        ru.setOnCheckedChangeListener((b, on) -> { prefs.edit().putBoolean("ru_direct", on).apply(); applyIfUp(); });
+        split.addView(ru, mw(4));
         int n = prefs.getString("apps", "").isEmpty() ? 0 : prefs.getString("apps", "").split(",").length;
         split.addView(button("Выбрать приложения (" + n + ")", 0xFF475569, v -> pickApps()), mw(8));
         split.addView(tv("Изменения применяются сразу. Само приложение всегда идёт напрямую — так обфускатор держит связь с сервером.",
@@ -431,8 +453,12 @@ public class MainActivity extends Activity {
 
     private static String tail(File f, int max) {
         try {
-            byte[] b = java.nio.file.Files.readAllBytes(f.toPath());
-            String t = new String(b, StandardCharsets.UTF_8);
+            java.io.ByteArrayOutputStream o = new java.io.ByteArrayOutputStream();
+            try (java.io.FileInputStream in = new java.io.FileInputStream(f)) {
+                byte[] buf = new byte[8192];
+                for (int n; (n = in.read(buf)) > 0; ) o.write(buf, 0, n);
+            }
+            String t = new String(o.toByteArray(), StandardCharsets.UTF_8);
             return t.length() > max ? t.substring(t.length() - max) : t;
         } catch (Exception e) { return ""; }
     }
