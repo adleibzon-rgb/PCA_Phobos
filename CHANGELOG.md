@@ -19,6 +19,10 @@ phobos-update beta      # или: phobos-update dev
 
 ---
 
+## Не выпущено
+
+- **feat:** подсеть VPN-клиентов задаётся при установке: `install.sh` и `secondary-setup.sh` спрашивают её в терминале (Enter = `10.25.0.0/16`) или берут `SERVER_WG_IPV4_NETWORK=10.25.1.0/24`. Неверная или публичная сеть — установка останавливается с ошибкой.
+
 ## 1.4.4 — канал «Облако» (через KeenDNS своего Keenetic)
 - **Канал «Облако»** в Android PCA Phobos VPN 1.4.4 и iPhone (TestFlight 1.0 (6)): телефон → облако KeenDNS → ваш Keenetic → сервер. Помогает, когда сам сервер заблокирован, а сайты Keenetic открываются; белый IP роутеру не нужен.
 - **wsgw** — шлюз WebSocket → UDP для Keenetic (Entware: aarch64, mipsel, mips) и Linux. Инструкция с картинками — [docs/cloud.md](docs/cloud.md).

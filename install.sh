@@ -29,7 +29,23 @@ PANEL_SCHEME="${PANEL_SCHEME:-http}"
 TG_TOKEN="${TG_TOKEN:-}"
 TG_CHAT="${TG_CHAT:-}"
 OBF_PORTS="${OBF_PORTS:-2083,5443,993}"
+# Подсеть клиентов: env SERVER_WG_IPV4_NETWORK или вопрос в терминале (Enter = 10.25.0.0/16)
+if [ -z "${SERVER_WG_IPV4_NETWORK:-}" ] && [ -r /dev/tty ] && [ -t 1 ]; then
+    printf 'Подсеть VPN-клиентов [10.25.0.0/16]: ' > /dev/tty
+    read -r -t 60 SERVER_WG_IPV4_NETWORK < /dev/tty || true
+fi
 SERVER_WG_IPV4_NETWORK="${SERVER_WG_IPV4_NETWORK:-10.25.0.0/16}"
+SERVER_WG_IPV4_NETWORK="$(python3 - "$SERVER_WG_IPV4_NETWORK" <<'PY'
+import ipaddress, sys
+try:
+    net = ipaddress.ip_network(sys.argv[1].strip(), strict=False)
+except ValueError:
+    sys.exit("ERROR: bad subnet " + sys.argv[1])
+if net.version != 4 or not net.is_private or net.prefixlen > 29:
+    sys.exit("ERROR: subnet must be private IPv4, /8../29 (e.g. 10.25.1.0/24)")
+print(net)
+PY
+)" || exit 1
 # Источник: Gitea git.bobyrev.com (основной), GitHub — запасной.
 # Каналы stable/beta/dev — ветки main/beta/dev одного публичного репозитория.
 PCA_GIT="${PCA_GIT:-https://git.bobyrev.com/PCA/PCA_Phobos}"
