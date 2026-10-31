@@ -61,7 +61,8 @@ public class MainActivity extends Activity {
     static GoBackend backend;
     static Process obfuscator, relay;
     static final int TCP_LPORT = 13256;
-    static volatile String transport = "";      // "UDP" | "TCP" while up
+    static volatile String transport = "";      // "UDP" | "TCP" | "Облако" while up
+    static WsRelay wsRelay;
     static final Tunnel TUNNEL = new Tunnel() {
         public String getName() { return "phobos"; }
         public void onStateChange(Tunnel.State s) { }
@@ -220,14 +221,14 @@ public class MainActivity extends Activity {
     private static final java.util.Set<String> OBF_KEYS = new java.util.HashSet<>(java.util.Arrays.asList(
             "target", "key", "masking", "idle-timeout", "max-dummy", "static-bindings", "max-clients", "target-if", "allow-clean", "in-timeout", "resolve-interval"));
 
-    private String obfPart(String conf, boolean viaTcp) {
+    private String obfPart(String conf, boolean viaRelay) {
         StringBuilder sb = new StringBuilder("[instance]\nsource-if = 127.0.0.1\nsource-lport = " + LPORT + "\n");
         for (String ln : section(conf, "[instance]")) {
             String k = key(ln);
             if (k.equals("source-if") || k.equals("source-lport") || k.equals("verbose")) continue;
             // configs from other Phobos builds carry keys our wg-obfuscator v1.6 rejects (obfuscate-bytes…)
             if (!OBF_KEYS.contains(k)) continue;
-            if (viaTcp && k.equals("target")) ln = "target = 127.0.0.1:" + TCP_LPORT;
+            if (viaRelay && k.equals("target")) ln = "target = 127.0.0.1:" + TCP_LPORT;
             sb.append(ln).append('\n');
         }
         sb.append("verbose = INFO\n");
@@ -239,6 +240,17 @@ public class MainActivity extends Activity {
         for (String ln : conf.split("\n")) {
             String t = ln.trim();
             if (t.startsWith("#") && t.contains("pca-tcp") && t.contains("=")) return val(t);
+        }
+        return "";
+    }
+
+    /** wss:// of the user's Keenetic (KeenDNS cloud subdomain -> wsgw): set in the app, or "# pca-ws = wss://…" in the link. */
+    private String wsUrl(String conf) {
+        String u = prefs.getString("ws_url", "");
+        if (!u.isEmpty()) return u;
+        for (String ln : conf.split("\n")) {
+            String t = ln.trim();
+            if (t.startsWith("#") && t.contains("pca-ws") && t.contains("=")) return val(t);
         }
         return "";
     }
@@ -267,24 +279,30 @@ public class MainActivity extends Activity {
         else if (req == 7) toast("Без разрешения на VPN подключиться нельзя");
     }
 
-    /** Start (or restart) obfuscator; via TCP it dials the local udptcp relay. */
-    private void startTransport(String conf, boolean viaTcp) throws Exception {
+    /** Start (or restart) obfuscator; via TCP / cloud it dials the local relay on TCP_LPORT. */
+    private void startTransport(String conf, String via) throws Exception {
         stopObfuscator();
         String lib = getApplicationInfo().nativeLibraryDir;
+        boolean viaTcp = "tcp".equals(via), viaWs = "cloud".equals(via);
+        if (viaWs) {
+            if (wsUrl(conf).isEmpty()) throw new IllegalStateException("не задан адрес роутера (wss://…) для канала «Облако»");
+            wsRelay = new WsRelay(TCP_LPORT, wsUrl(conf), this::log);
+            wsRelay.start();
+        }
         if (viaTcp) {
             String host = target(conf).replaceAll(":\\d+$", "");
             relay = new ProcessBuilder(lib + "/libudptcp.so", "-c", "127.0.0.1:" + TCP_LPORT, host + ":" + tcpPort(conf))
                     .redirectErrorStream(true).redirectOutput(new File(getFilesDir(), "tcp.log")).start();
         }
         File cfg = new File(getFilesDir(), "obf.conf");
-        try (FileOutputStream o = new FileOutputStream(cfg)) { o.write(obfPart(conf, viaTcp).getBytes(StandardCharsets.UTF_8)); }
+        try (FileOutputStream o = new FileOutputStream(cfg)) { o.write(obfPart(conf, viaTcp || viaWs).getBytes(StandardCharsets.UTF_8)); }
         obfuscator = new ProcessBuilder(lib + "/libwgobfuscator.so", "-c", cfg.getAbsolutePath())
                 .redirectErrorStream(true).redirectOutput(new File(getFilesDir(), "obf.log")).start();
         Thread.sleep(600);
         if (!obfuscator.isAlive()) throw new IllegalStateException("обфускатор завершился, код " + obfuscator.exitValue() + " — см. «Журнал»");
         if (relay != null && !relay.isAlive()) throw new IllegalStateException("TCP-канал не запустился — см. «Журнал»");
-        transport = viaTcp ? "TCP" : "UDP";
-        log("transport " + transport + " -> " + target(conf) + (viaTcp ? " tcp:" + tcpPort(conf) : ""));
+        transport = viaWs ? "Облако" : viaTcp ? "TCP" : "UDP";
+        log("transport " + transport + " -> " + (viaWs ? wsUrl(conf) : target(conf) + (viaTcp ? " tcp:" + tcpPort(conf) : "")));
     }
 
     private void up() {
@@ -293,7 +311,7 @@ public class MainActivity extends Activity {
             String mode = prefs.getString("transport", "auto");
             boolean tcpAvail = !tcpPort(conf).isEmpty();
             if ("tcp".equals(mode) && !tcpAvail) throw new IllegalStateException("на сервере нет TCP-канала — обновите панель и заново импортируйте ссылку");
-            startTransport(conf, "tcp".equals(mode));
+            startTransport(conf, "auto".equals(mode) ? "udp" : mode);
             Config c = Config.parse(new BufferedReader(new StringReader(
                     wgPart(conf, prefs.getString("mode", MODE_ALL), prefs.getString("apps", "")))));
             backend.setState(TUNNEL, Tunnel.State.UP, c);
@@ -315,7 +333,7 @@ public class MainActivity extends Activity {
                 if (!isUp() || !"UDP".equals(transport)) return;
                 if (backend.getStatistics(TUNNEL).totalRx() > 0) return;
                 log("UDP: no answer in 15 s -> switching to TCP");
-                startTransport(conf, true);
+                startTransport(conf, "tcp");
                 post("UDP не отвечает — переключился на TCP");
             } catch (Throwable e) { log("watchUdp: " + e); }
         }).start();
@@ -331,6 +349,7 @@ public class MainActivity extends Activity {
     private static void stopObfuscator() {
         if (obfuscator != null) { obfuscator.destroy(); obfuscator = null; }
         if (relay != null) { relay.destroy(); relay = null; }
+        if (wsRelay != null) { wsRelay.stop(); wsRelay = null; }
     }
 
     private void post(String msg) { ui.post(() -> { toast(msg); refresh(); }); }
@@ -416,13 +435,16 @@ public class MainActivity extends Activity {
         RadioGroup tg = new RadioGroup(this);
         tg.setOrientation(RadioGroup.HORIZONTAL);
         String tmode = prefs.getString("transport", "auto");
-        for (String[] m : new String[][]{{"auto", "Авто"}, {"udp", "UDP"}, {"tcp", "TCP"}}) {
+        for (String[] m : new String[][]{{"auto", "Авто"}, {"udp", "UDP"}, {"tcp", "TCP"}, {"cloud", "Облако"}}) {
             RadioButton r = new RadioButton(this);
             r.setText(m[1]);
             r.setTextColor(text());
             r.setId(View.generateViewId());
             r.setChecked(m[0].equals(tmode));
-            r.setOnClickListener(v -> { prefs.edit().putString("transport", m[0]).apply(); applyIfUp(); });
+            r.setOnClickListener(v -> {
+                prefs.edit().putString("transport", m[0]).apply();
+                if ("cloud".equals(m[0])) wsDialog(); else applyIfUp();
+            });
             tg.addView(r);
         }
         split.addView(tg);
@@ -475,6 +497,22 @@ public class MainActivity extends Activity {
         }
         new AlertDialog.Builder(this).setTitle("Ссылка из панели").setView(e)
                 .setPositiveButton("Импорт", (d, w) -> { importLink(e.getText().toString()); applyIfUp(); render(); })
+                .setNegativeButton("Отмена", null).show();
+    }
+
+    /** Channel "Облако": address of the user's Keenetic web app (KeenDNS cloud) with wsgw behind it. */
+    private void wsDialog() {
+        final EditText e = new EditText(this);
+        e.setHint("wss://phobos.имя.keenetic.pro/");
+        e.setText(wsUrl(prefs.getString("conf", "")));
+        new AlertDialog.Builder(this).setTitle("Адрес роутера (KeenDNS)").setView(e)
+                .setMessage("Канал через облако Keenetic: телефон → облако KeenDNS → ваш роутер → сервер.")
+                .setPositiveButton("Сохранить", (d, w) -> {
+                    String u = e.getText().toString().trim();
+                    if (!u.isEmpty() && !u.startsWith("wss://")) u = "wss://" + u.replaceFirst("^\\w+://", "");
+                    prefs.edit().putString("ws_url", u).apply();
+                    applyIfUp();
+                })
                 .setNegativeButton("Отмена", null).show();
     }
 

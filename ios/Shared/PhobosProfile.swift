@@ -60,6 +60,17 @@ struct PhobosProfile {
         return nil
     }
 
+    /// "# pca-ws = wss://…" — the user's Keenetic (KeenDNS cloud subdomain -> wsgw), channel «Облако».
+    var wsURL: String? {
+        for rawLine in raw.split(separator: "\n") {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("#"), line.contains("pca-ws"), let eq = line.firstIndex(of: "=") {
+                return line[line.index(after: eq)...].trimmingCharacters(in: .whitespaces)
+            }
+        }
+        return nil
+    }
+
     func obfuscatorConfig(listen: Int, target: String) -> String {
         var out = "[instance]\nsource-if = 127.0.0.1\nsource-lport = \(listen)\ntarget = \(target)\n"
         for item in lines("[instance]") where !["source-if", "source-lport", "target", "verbose"].contains(item.key) {
@@ -70,7 +81,13 @@ struct PhobosProfile {
 
     func wireGuardConfig(endpoint: String, allowedIPs: String?) -> String {
         var out = "[Interface]\n"
-        for item in lines("[Interface]") where !item.key.hasSuffix("applications") { out += item.line + "\n" }
+        for item in lines("[Interface]") where !item.key.hasSuffix("applications") && item.key != "mtu" { out += item.line + "\n" }
+        // ponytail: obfuscator masking adds bytes; the panel's default 1420 stalls on mobile networks,
+        // so 1420/missing -> 1280, any other MTU in the link wins (set per client in the panel)
+        let linkMTU = lines("[Interface]").first { $0.key == "mtu" }
+            .flatMap { Int($0.line.split(separator: "=").last?.trimmingCharacters(in: .whitespaces) ?? "") }
+        let mtu = (linkMTU == nil || linkMTU == 1420) ? 1280 : linkMTU!
+        out += "MTU = \(mtu)\n"
         out += "\n[Peer]\n"
         for item in lines("[Peer]") {
             switch item.key {

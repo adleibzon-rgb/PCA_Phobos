@@ -37,7 +37,7 @@ WG_CONFIG = "/etc/wireguard/wg0.conf"
 # Distribution: Gitea first (GitHub account is unavailable since 23.10.2026), GitHub fallback
 PCA_GIT = "https://git.bobyrev.com/PCA/PCA_Phobos"
 PCA_GH_RAW = "https://raw.githubusercontent.com/andrey271192/PCA_Phobos"
-APK_TAG = "v1.4.2"
+APK_TAG = "v1.4.4"
 WARP_DIR = f"{PHOBOS_DIR}/server/warp"
 WARP_CUSTOM_PROFILE_FILE = f"{WARP_DIR}/custom-profile.conf"
 WARP_LICENSE_FILE = f"{WARP_DIR}/license.key"

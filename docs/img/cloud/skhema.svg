@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="430" viewBox="0 0 1200 430" font-family="Helvetica, Arial, sans-serif">
+<rect width="1200" height="430" fill="#ffffff"/>
+<text x="600" y="38" text-anchor="middle" font-size="24" font-weight="bold" fill="#0f172a">Канал «Облако»: телефон → облако KeenDNS → свой Keenetic → сервер Phobos</text>
+<defs><marker id="a" markerWidth="10" markerHeight="10" refX="9" refY="5" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#475569"/></marker></defs>
+<g font-size="17">
+<rect x="20" y="90" width="200" height="130" rx="14" fill="#eef2ff" stroke="#4f46e5" stroke-width="2"/>
+<text x="120" y="125" text-anchor="middle" font-weight="bold" fill="#1e1b4b">Телефон</text>
+<text x="120" y="152" text-anchor="middle" fill="#334155">PCA Phobos VPN</text>
+<text x="120" y="176" text-anchor="middle" fill="#334155">канал «Облако»</text>
+<text x="120" y="200" text-anchor="middle" fill="#334155">WireGuard+обфускатор</text>
+<rect x="320" y="90" width="210" height="130" rx="14" fill="#f0f9ff" stroke="#0ea5e9" stroke-width="2"/>
+<text x="425" y="125" text-anchor="middle" font-weight="bold" fill="#0c4a6e">Облако KeenDNS</text>
+<text x="425" y="152" text-anchor="middle" fill="#334155">серверы Keenetic в РФ</text>
+<text x="425" y="176" text-anchor="middle" fill="#334155">пересылает HTTPS</text>
+<text x="425" y="200" text-anchor="middle" fill="#334155">по имени (SNI)</text>
+<rect x="630" y="90" width="250" height="130" rx="14" fill="#f0fdf4" stroke="#16a34a" stroke-width="2"/>
+<text x="755" y="125" text-anchor="middle" font-weight="bold" fill="#14532d">Ваш Keenetic</text>
+<text x="755" y="152" text-anchor="middle" fill="#334155">поддомен phobos.* (TLS)</text>
+<text x="755" y="176" text-anchor="middle" fill="#334155">→ шлюз wsgw :18090</text>
+<text x="755" y="200" text-anchor="middle" fill="#334155">WebSocket → UDP</text>
+<rect x="980" y="90" width="200" height="130" rx="14" fill="#fff7ed" stroke="#ea580c" stroke-width="2"/>
+<text x="1080" y="125" text-anchor="middle" font-weight="bold" fill="#7c2d12">Сервер Phobos</text>
+<text x="1080" y="152" text-anchor="middle" fill="#334155">обфускатор UDP</text>
+<text x="1080" y="176" text-anchor="middle" fill="#334155">→ WireGuard</text>
+<text x="1080" y="200" text-anchor="middle" fill="#334155">→ интернет</text>
+</g>
+<g stroke="#475569" stroke-width="3" marker-end="url(#a)"><line x1="222" y1="155" x2="316" y2="155"/><line x1="532" y1="155" x2="626" y2="155"/><line x1="882" y1="155" x2="976" y2="155"/></g>
+<g font-size="15" fill="#475569" text-anchor="middle">
+<text x="270" y="140">wss:// 443</text><text x="580" y="140">туннель</text><text x="580" y="178">Keenetic</text><text x="930" y="140">UDP</text></g>
+<rect x="20" y="260" width="1160" height="150" rx="14" fill="#f8fafc" stroke="#cbd5e1"/>
+<g font-size="17" fill="#0f172a">
+<text x="44" y="295" font-weight="bold">Когда нужно</text>
+<text x="44" y="322">• у оператора/в сети заблокирован сервер Phobos (UDP и TCP), а сайты Keenetic открываются;</text>
+<text x="44" y="348">• у роутера нет белого IP — облако KeenDNS достаёт его всё равно.</text>
+<text x="44" y="380" font-weight="bold">Проверено 31.10.2026: </text><text x="250" y="380">планшет → облако → домашний Keenetic → Польша, ↓11 / ↑15 Мбит/с, потерь 0 %.</text>
+</g>
+</svg>

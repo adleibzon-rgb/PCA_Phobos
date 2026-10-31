@@ -35,4 +35,7 @@ let obf = p.obfuscatorConfig(listen: 13255, target: "127.0.0.1:13258")
 precondition(obf.contains("target = 127.0.0.1:13258") && obf.contains("key = testkey") && !obf.contains("203.0.113.10"))
 let wg = p.wireGuardConfig(endpoint: "127.0.0.1:13255", allowedIPs: "1.0.0.0/8")
 precondition(wg.contains("Endpoint = 127.0.0.1:13255") && wg.contains("AllowedIPs = 1.0.0.0/8") && !wg.contains("= none"))
+precondition(wg.contains("MTU = 1280") && !wg.contains("1420"))  // panel default -> 1280
+let custom = PhobosProfile.fromLink("phobos://" + Data(conf.replacingOccurrences(of: "MTU = 1420", with: "MTU = 1300").utf8).base64EncodedString())!.0
+precondition(custom.wireGuardConfig(endpoint: "e", allowedIPs: nil).contains("MTU = 1300"))  // link MTU wins
 print("profile_check ok")

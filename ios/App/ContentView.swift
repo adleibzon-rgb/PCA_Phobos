@@ -11,6 +11,7 @@ struct ContentView: View {
             ScrollView {
                 VStack(spacing: 18) {
                     profileCard
+                    if vpn.servers.count > 1 { serversCard }
                     powerButton
                     statusLine
                     optionsCard
@@ -57,6 +58,30 @@ struct ContentView: View {
         .padding().background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
     }
 
+    private var serversCard: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Серверы").font(.subheadline.bold()).padding(.bottom, 6)
+            ForEach(vpn.servers, id: \.self) { s in
+                let n = s["name"] ?? ""
+                HStack {
+                    Image(systemName: n == vpn.name ? "checkmark.circle.fill" : "circle")
+                        .foregroundStyle(n == vpn.name ? .green : .secondary)
+                    Text(n)
+                    Spacer()
+                    if n != vpn.name {
+                        Button(role: .destructive) { vpn.remove(n) } label: { Image(systemName: "trash") }
+                            .buttonStyle(.borderless)
+                    }
+                }
+                .padding(.vertical, 8)
+                .contentShape(Rectangle())
+                .onTapGesture { vpn.select(n) }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding().background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
+    }
+
     private var powerButton: some View {
         Button(action: vpn.toggle) {
             Text(vpn.isOn ? "Отключить" : "Подключить")
@@ -85,9 +110,16 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Канал до сервера").font(.subheadline.bold())
                 Picker("Канал", selection: $vpn.transportMode) {
-                    Text("Авто").tag("auto"); Text("UDP").tag("udp"); Text("TCP").tag("tcp")
+                    Text("Авто").tag("auto"); Text("UDP").tag("udp"); Text("TCP").tag("tcp"); Text("Облако").tag("cloud")
                 }
                 .pickerStyle(.segmented)
+                if vpn.transportMode == "cloud" {
+                    TextField("wss://phobos.имя.keenetic.pro/", text: $vpn.wsURL)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
+                        .textFieldStyle(.roundedBorder).onSubmit { vpn.wsURL = vpn.wsURL.trimmingCharacters(in: .whitespaces) }
+                    Text("Облако: телефон → облако KeenDNS → ваш Keenetic → сервер. Работает, когда до сервера напрямую не достучаться.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 Text("Авто: если UDP режут, через 15 секунд переходит на TCP. Изменения применяются сразу.")
                     .font(.caption).foregroundStyle(.secondary)
             }

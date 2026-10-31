@@ -19,6 +19,11 @@ phobos-update beta      # или: phobos-update dev
 
 ---
 
+## 1.4.4 — канал «Облако» (через KeenDNS своего Keenetic)
+- **Канал «Облако»** в Android PCA Phobos VPN 1.4.4 и iPhone (TestFlight 1.0 (6)): телефон → облако KeenDNS → ваш Keenetic → сервер. Помогает, когда сам сервер заблокирован, а сайты Keenetic открываются; белый IP роутеру не нужен.
+- **wsgw** — шлюз WebSocket → UDP для Keenetic (Entware: aarch64, mipsel, mips) и Linux. Инструкция с картинками — [docs/cloud.md](docs/cloud.md).
+- Панель: ссылки на приложения ведут на v1.4.4. Остальной сервер не менялся.
+
 ## 1.4.2 — настройка обфускатора сервера
 
 - **feat:** в панели «Настройки» → «Обфускатор сервера»: masking (AUTO/STUN/NONE), max-dummy, idle — записываются во все порты сервера, обфускатор перезапускается (клиенты переподключаются за секунды).

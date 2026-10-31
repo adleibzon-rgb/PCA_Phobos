@@ -12,6 +12,11 @@ import WireGuardKitC
 /// A type alias for `Result` type that holds a tuple with source and resolved endpoint.
 typealias EndpointResolutionResult = Result<(Endpoint, Endpoint), DNSResolutionError>
 
+/// PCA Phobos: IPv4 CIDRs that must not go into the tunnel (set before adapter.start).
+public enum PhobosRoutes {
+    public static var excludedIPv4: [String] = []
+}
+
 class PacketTunnelSettingsGenerator {
     let tunnelConfiguration: TunnelConfiguration
     let resolvedEndpoints: [Endpoint?]
@@ -118,6 +123,11 @@ class PacketTunnelSettingsGenerator {
 
         let ipv4Settings = NEIPv4Settings(addresses: ipv4Addresses.map { $0.destinationAddress }, subnetMasks: ipv4Addresses.map { $0.destinationSubnetMask })
         ipv4Settings.includedRoutes = ipv4IncludedRoutes
+        // PCA Phobos: "Russian sites direct" = these networks bypass the tunnel
+        ipv4Settings.excludedRoutes = PhobosRoutes.excludedIPv4.compactMap { cidr in
+            guard let range = IPAddressRange(from: cidr) else { return nil }
+            return NEIPv4Route(destinationAddress: "\(range.address)", subnetMask: "\(range.subnetMask())")
+        }
         networkSettings.ipv4Settings = ipv4Settings
 
         let ipv6Settings = NEIPv6Settings(addresses: ipv6Addresses.map { $0.destinationAddress }, networkPrefixLengths: ipv6Addresses.map { $0.destinationNetworkPrefixLength })

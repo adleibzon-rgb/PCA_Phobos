@@ -1,0 +1,10 @@
+#!/bin/sh
+# PCA Phobos: WebSocket -> UDP gateway (transport "Keenetic cloud"). Config: /opt/etc/wsgw.conf
+[ -f /opt/etc/wsgw.conf ] && . /opt/etc/wsgw.conf
+ENABLED=yes
+PROCS=wsgw
+ARGS="-l ${WSGW_LISTEN:-127.0.0.1:18090} -t $WSGW_TARGET"
+PREARGS=""
+DESC=$PROCS
+PATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin
+. /opt/etc/init.d/rc.func

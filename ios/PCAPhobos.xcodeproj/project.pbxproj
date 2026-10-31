@@ -14,6 +14,7 @@
 		38870650A7C2B1F0927A1230 /* wg-obfuscator.c in Sources */ = {isa = PBXBuildFile; fileRef = 1FADBB2A65AF77D4ECCAFE78 /* wg-obfuscator.c */; settings = {COMPILER_FLAGS = "-Dmain=wgobf_main -w"; }; };
 		4E4255B9E0F8626F6E209B0F /* String+ArrayConversion.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7500F0B31797D49B5BBEC5CC /* String+ArrayConversion.swift */; };
 		56F35C68C6A387E499703CFF /* masking.c in Sources */ = {isa = PBXBuildFile; fileRef = CCE5C98CD905BDE16A8D83D4 /* masking.c */; settings = {COMPILER_FLAGS = "-Dmain=wgobf_main -w"; }; };
+		599057D9048B5FF1EA0E6000 /* WsLink.swift in Sources */ = {isa = PBXBuildFile; fileRef = EC83AB79BE0E361F4EE90875 /* WsLink.swift */; };
 		5F5D376513C0B27C45A3E7B6 /* ru_bypass.txt in Resources */ = {isa = PBXBuildFile; fileRef = 2572D9A6F822B038D0652619 /* ru_bypass.txt */; };
 		78B74F81E0042D9AD94B7A6B /* config.c in Sources */ = {isa = PBXBuildFile; fileRef = 0E5C1673464AAC3EF81DD2FE /* config.c */; settings = {COMPILER_FLAGS = "-Dmain=wgobf_main -w"; }; };
 		7D8AB66421409CBFCCF2769A /* PhobosProfile.swift in Sources */ = {isa = PBXBuildFile; fileRef = 98DC1765DEC5F326E2B5F9C4 /* PhobosProfile.swift */; };
@@ -70,6 +71,7 @@
 		B3E470E13EF603CB26991683 /* PCAPhobosApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PCAPhobosApp.swift; sourceTree = "<group>"; };
 		CA6480536DA633DB94B6930F /* WireGuardKit */ = {isa = PBXFileReference; lastKnownFileType = folder; name = WireGuardKit; path = WireGuardKit; sourceTree = SOURCE_ROOT; };
 		CCE5C98CD905BDE16A8D83D4 /* masking.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = masking.c; sourceTree = "<group>"; };
+		EC83AB79BE0E361F4EE90875 /* WsLink.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WsLink.swift; sourceTree = "<group>"; };
 		EF9115CA0D5EC52C8679A12A /* obfuscation.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = obfuscation.c; sourceTree = "<group>"; };
 		FF14952A4263FF0E004A3F04 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -103,6 +105,7 @@
 				2572D9A6F822B038D0652619 /* ru_bypass.txt */,
 				7500F0B31797D49B5BBEC5CC /* String+ArrayConversion.swift */,
 				2C1AA6DED9B45949864A9B7D /* TunnelConfiguration+WgQuickConfig.swift */,
+				EC83AB79BE0E361F4EE90875 /* WsLink.swift */,
 			);
 			path = Tunnel;
 			sourceTree = "<group>";
@@ -214,11 +217,11 @@
 				LastUpgradeCheck = 1430;
 				TargetAttributes = {
 					0FD066BC2C51A1E092914FE8 = {
-						DevelopmentTeam = "";
+						DevelopmentTeam = Q5FKU39TUA;
 						ProvisioningStyle = Automatic;
 					};
 					E1F7E69029753CF102C6CE2E = {
-						DevelopmentTeam = "";
+						DevelopmentTeam = Q5FKU39TUA;
 						ProvisioningStyle = Automatic;
 					};
 				};
@@ -274,6 +277,7 @@
 				7D8AB66421409CBFCCF2769A /* PhobosProfile.swift in Sources */,
 				4E4255B9E0F8626F6E209B0F /* String+ArrayConversion.swift in Sources */,
 				11F2A6A8D281AB36B45D4603 /* TunnelConfiguration+WgQuickConfig.swift in Sources */,
+				599057D9048B5FF1EA0E6000 /* WsLink.swift in Sources */,
 				78B74F81E0042D9AD94B7A6B /* config.c in Sources */,
 				1C05D29ACA95548374AD6FD9 /* logging.c in Sources */,
 				56F35C68C6A387E499703CFF /* masking.c in Sources */,
@@ -385,9 +389,9 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 141;
+				CURRENT_PROJECT_VERSION = 6;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = Q5FKU39TUA;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
@@ -399,7 +403,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
-				MARKETING_VERSION = 1.4.1;
+				MARKETING_VERSION = 1.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -445,9 +449,9 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				CODE_SIGN_STYLE = Automatic;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 141;
+				CURRENT_PROJECT_VERSION = 6;
 				DEBUG_INFORMATION_FORMAT = dwarf;
-				DEVELOPMENT_TEAM = "";
+				DEVELOPMENT_TEAM = Q5FKU39TUA;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
@@ -465,7 +469,7 @@
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
-				MARKETING_VERSION = 1.4.1;
+				MARKETING_VERSION = 1.0;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
