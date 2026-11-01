@@ -29,6 +29,17 @@ PANEL_SCHEME="${PANEL_SCHEME:-http}"
 TG_TOKEN="${TG_TOKEN:-}"
 TG_CHAT="${TG_CHAT:-}"
 OBF_PORTS="${OBF_PORTS:-2083,5443,993}"
+# Уже есть wg0.conf (переустановка) — подсеть берём из него, иначе server.env разойдётся с интерфейсом
+if [ -z "${SERVER_WG_IPV4_NETWORK:-}" ] && [ -f /etc/wireguard/wg0.conf ]; then
+    SERVER_WG_IPV4_NETWORK="$(python3 - <<'PY' 2>/dev/null
+import ipaddress, re
+for ln in open("/etc/wireguard/wg0.conf"):
+    m = re.match(r"\s*Address\s*=\s*([^,\s]+)", ln)
+    if m:
+        print(ipaddress.ip_interface(m.group(1)).network); break
+PY
+)" || SERVER_WG_IPV4_NETWORK=""
+fi
 # Подсеть клиентов: env SERVER_WG_IPV4_NETWORK или вопрос в терминале (Enter = 10.25.0.0/16)
 if [ -z "${SERVER_WG_IPV4_NETWORK:-}" ] && [ -r /dev/tty ] && [ -t 1 ]; then
     printf 'Подсеть VPN-клиентов [10.25.0.0/16]: ' > /dev/tty
