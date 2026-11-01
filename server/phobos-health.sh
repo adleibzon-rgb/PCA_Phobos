@@ -189,9 +189,18 @@ switch_wg_peer() {
     # Add the target peer if it is not already present
     if ! echo "$present" | grep -q "^${new_key}$"; then
         log "WG PEER add: $new_key"
-        curl -s -X POST "http://localhost:79/rci/" \
-            -H "Content-Type: application/json" \
-            -d "{\"interface\":{\"${WG_IF}\":{\"wireguard\":{\"peer\":{\"key\":\"${new_key}\",\"comment\":\"Phobos VPS Server\",\"endpoint\":{\"address\":\"127.0.0.1:13255\"},\"keepalive-interval\":{\"interval\":25},\"allow-ips\":[{\"address\":\"0.0.0.0\",\"mask\":\"0.0.0.0\"},{\"address\":\"::\",\"mask\":\"0\"}]}}}}}" >/dev/null 2>&1
+        # 01.11.2026: порт — из конфига обфускатора (было зашито 13255, а установщик
+        # берёт свободный, на части роутеров 51820 → после переключения туннель мёртв).
+        # Через ndmc по шагам: JSON-RCI с allow-ips "::"/0 молча не ставил allow-ips.
+        lport=$(grep 'source-lport' "$PHOBOS_DIR/wg-obfuscator.conf" 2>/dev/null | tr -d ' ' | cut -d'=' -f2)
+        lport=${lport:-13255}
+        ndmc -c "interface $WG_IF wireguard peer $new_key" >/dev/null 2>&1
+        ndmc -c "interface $WG_IF wireguard peer $new_key endpoint 127.0.0.1:$lport" >/dev/null 2>&1
+        ndmc -c "interface $WG_IF wireguard peer $new_key keepalive-interval 25" >/dev/null 2>&1
+        ndmc -c "interface $WG_IF wireguard peer $new_key allow-ips 0.0.0.0 0.0.0.0" >/dev/null 2>&1
+        # ядро не всегда подхватывает allow-ips нового пира без перезапуска интерфейса
+        ndmc -c "interface $WG_IF down" >/dev/null 2>&1; sleep 1
+        ndmc -c "interface $WG_IF up" >/dev/null 2>&1
     fi
 
     # Persist config
