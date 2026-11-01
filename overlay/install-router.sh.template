@@ -456,27 +456,20 @@ deploy_health_monitor() {
   [ -f "$PHOBOS_DIR/phobos-pull.sh" ] || pull_line=""
 
   if [ "$ROUTER_PLATFORM" = "keenetic" ]; then
-    # Install cron if not present (Entware)
-    if ! command -v crontab >/dev/null 2>&1 && command -v opkg >/dev/null 2>&1; then
-      log "  Установка cron через opkg..."
-      opkg update >/dev/null 2>&1
-      opkg install cron >/dev/null 2>&1
-      /opt/etc/init.d/S10cron start >/dev/null 2>&1 || true
+    # Демон — busybox crond (есть в Entware как /opt/sbin/crond). Entware-пакет cron
+    # (vixie, PROCS=cron) на Keenetic задачи не выполнял — заменяем (01.11.2026)
+    local I=/opt/etc/init.d/S10cron
+    if [ ! -x $I ] || grep -q "^PROCS=cron$" $I; then
+      $I stop >/dev/null 2>&1
+      printf '#!/bin/sh\n\nENABLED=yes\nPROCS=crond\nARGS="-c /opt/var/spool/cron/crontabs -b"\nPREARGS=""\nDESC=$PROCS\nPATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\n. /opt/etc/init.d/rc.func\n' > $I
+      chmod +x $I
     fi
-    local cron_file="/opt/etc/crontab"
-    # Create crontab file if missing
-    if [ ! -f "$cron_file" ]; then
-      mkdir -p /opt/etc
-      touch "$cron_file"
-    fi
-    if ! grep -q "phobos-health" "$cron_file" 2>/dev/null; then
-      echo "$cron_line" >> "$cron_file"
-      log "  Cron (health) добавлен в $cron_file"
-    fi
-    if [ -n "$pull_line" ] && ! grep -q "phobos-pull" "$cron_file" 2>/dev/null; then
-      echo "$pull_line" >> "$cron_file"
-      log "  Cron (pull) добавлен в $cron_file"
-    fi
+    mkdir -p /opt/var/spool/cron/crontabs
+    # 01.11.2026: демоны cron на Keenetic (busybox crond, Entware cron) читают crontab
+    # пользователя root, а не /opt/etc/crontab — туда писать бесполезно
+    sed -i "/phobos-health\|phobos-pull/d" /opt/etc/crontab 2>/dev/null
+    (crontab -l 2>/dev/null | grep -v "phobos-health" | grep -v "phobos-pull"; echo "$cron_line"; [ -n "$pull_line" ] && echo "$pull_line") | crontab -
+    log "  Cron добавлен через crontab (health + pull)"
     /opt/etc/init.d/S10cron restart >/dev/null 2>&1 || true
   elif [ "$ROUTER_PLATFORM" = "openwrt" ]; then
     (crontab -l 2>/dev/null | grep -v "phobos-health" | grep -v "phobos-pull"; echo "$cron_line"; [ -n "$pull_line" ] && echo "$pull_line") | crontab -
