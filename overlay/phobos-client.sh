@@ -220,7 +220,7 @@ action_package() {
   cp "$dir/wg-obfuscator.conf" "$pkg_root/wg-obfuscator.conf"
 
   # Fetch missing router-arch binaries from ClusterM on-demand
-  local _tag; _tag=$(curl -fsSL -m10 https://api.github.com/repos/ClusterM/wg-obfuscator/releases/latest 2>/dev/null | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\(.*\)".*/\1/')
+  local _tag; _tag=$(curl -fsSL -m10 https://api.github.com/repos/ClusterM/wg-obfuscator/releases/latest 2>/dev/null | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\(.*\)".*/\1/') || _tag=""  # ponytail: GitHub API rate limit/недоступность не должны ронять сборку пакета — берём уже скачанные бинарники
   local _cb="https://github.com/ClusterM/wg-obfuscator/releases/download/${_tag}"
   declare -A _am=([aarch64]="linux-arm64" [mipsel]="linux-mipsel-mips32" [mips]="linux-mips-mips32" [armv7]="linux-armv7-hf" [x86_64]="linux-x64")
   for _arch in aarch64 mipsel mips armv7 x86_64; do
