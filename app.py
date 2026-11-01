@@ -3449,8 +3449,9 @@ def router_config(client_id):
     st = load_settings()
     token = request.args.get("token", "")
     acc = st.get("router_access", {}).get(client_id, {})
-    expected = acc.get("pull_token", "") or st.get("server_api_key", "")
-    if not expected or token != expected:
+    # packages ship server_api_key as pull_token (phobos-client.sh), so accept both
+    expected = {t for t in (acc.get("pull_token", ""), st.get("server_api_key", "")) if t}
+    if not token or token not in expected:
         return ("forbidden", 403)
     conf = generate_failover_conf_for_client(client_id)
     return (conf, 200, {"Content-Type": "text/plain; charset=utf-8"})
