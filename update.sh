@@ -42,9 +42,17 @@ restart_panel_service() {
 # since 1.4.0 all channels are branches of one public repo (no subscriber token)
 is_private() { return 1; }
 
+PCA_GIT_DEV="${PCA_GIT_DEV:-https://git.bobyrev.com/PCA/PCA_Phobos-dev}"
+
 fetch_repo_file() {  # $1=ref $2=repo_path $3=output ; Gitea first, GitHub fallback
     local ref="$1" rp="$2" out="$3" kind=branch
     case "$ref" in v[0-9]*) kind=tag;; esac
+    # beta/dev live in the private Gitea repo PCA_Phobos-dev: read-only Gitea token in $PANEL_DIR/.gh_token or GH_TOKEN
+    case "$ref" in beta|dev)
+        if [ -n "$GH_TOKEN" ]; then
+            curl -fsSL -m25 -H "Authorization: token $GH_TOKEN" "$PCA_GIT_DEV/raw/branch/$ref/$rp?cb=$(date +%s)" -o "$out" 2>/dev/null && return 0
+        fi;;
+    esac
     curl -fsSL -m25 "$PCA_GIT/raw/$kind/$ref/$rp?cb=$(date +%s)" -o "$out" 2>/dev/null && return 0
     curl -fsSL -m25 "$GH_RAW/$ref/$rp?cb=$(date +%s)" -o "$out"
 }
@@ -241,6 +249,15 @@ case "${1:-}" in
         echo "Токен — по подписке: https://boosty.to/andrey27 . Стабильная (без токена): phobos-update stable"
         exit 1
     fi
+    case "$ref" in beta|dev)
+        if [ -z "$GH_TOKEN" ]; then
+            echo "Каналы beta и dev — по токену подписчика (read-only токен Gitea)."
+            echo "Вставь токен в панели: Настройки → Версия и обновления → «токен подписчика», или:"
+            echo "  GH_TOKEN=ваш_токен phobos-update $ref"
+            echo "Стабильная (без токена): phobos-update stable"
+            exit 1
+        fi;;
+    esac
     if ! ref_exists "$ref"; then
         echo "Версия/ветка '$ref' не найдена (или токен неверный). Обновление отменено (текущая $CUR не тронута)."
         echo "Доступные: phobos-update --versions  ·  стабильная: $(latest_version)"
