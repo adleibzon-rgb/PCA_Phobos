@@ -71,7 +71,7 @@ fetch_config() {
     if command -v curl >/dev/null; then
         curl -k -s -m 8 -o "$TMP" "$url" 2>/dev/null && return 0
     fi
-    wget --no-check-certificate -q -O "$TMP" "$url" 2>/dev/null || wget -q -O "$TMP" "$url" 2>/dev/null
+    wget -T 8 --no-check-certificate -q -O "$TMP" "$url" 2>/dev/null || wget -T 8 -q -O "$TMP" "$url" 2>/dev/null
 }
 
 # One fetch + compare + apply pass. Returns 0 always (best-effort).
