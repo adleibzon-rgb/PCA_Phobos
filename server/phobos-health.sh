@@ -96,8 +96,10 @@ FAIL_COUNT=$(cat "$STATE/fail_count" 2>/dev/null || echo "0")
 PRIMARY_CHECK_TS=$(cat "$STATE/primary_check_ts" 2>/dev/null || echo "0")
 
 # ── Detect Phobos WG interface (non-fatal, fallback to Wireguard3) ──
+# Нет своего интерфейса — выходим: запасной Wireguard3 бывает чужим туннелем.
 detect_wg_interface || {
-    log "WARN: detect failed, using default $WG_IF"
+    log "ERROR: own WG interface not found, skip"
+    exit 0
 }
 
 # ── Get handshake age via ndmc ──
