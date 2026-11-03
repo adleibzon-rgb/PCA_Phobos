@@ -371,6 +371,13 @@ sleep 2
 mkdir -p "$PANEL_DIR"
 echo "$CHANNEL" > "$PANEL_DIR/.channel" 2>/dev/null || true
 
+# при переустановке settings.json остаётся старый — в сводке показываем то, что реально в панели
+_S="$PANEL_DIR/settings.json"
+if [ -f "$_S" ]; then
+  API_KEY="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("server_api_key") or sys.argv[2])' "$_S" "$API_KEY" 2>/dev/null || echo "$API_KEY")"
+  PANEL_PASS="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("admin_pass") or sys.argv[2])' "$_S" "$PANEL_PASS" 2>/dev/null || echo "$PANEL_PASS")"
+fi
+
 echo ""
 echo "============================================"
 echo "  Installation complete"
