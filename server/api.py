@@ -69,11 +69,16 @@ def health():
         out = subprocess.check_output(["wg", "show", "wg0", "dump"], text=True, timeout=5)
         peer_keys = []
         handshakes = {}
+        transfer = {}
         for line in out.strip().split("\n")[1:]:
             parts = line.split("\t")
             if len(parts) >= 4:
                 pub = parts[0]
                 peer_keys.append(pub)
+                try:
+                    transfer[pub] = [int(parts[5]), int(parts[6])]
+                except Exception:
+                    pass
                 try:
                     handshakes[pub] = int(parts[4])
                 except Exception:
@@ -83,6 +88,7 @@ def health():
         peers = 0
         peer_keys = []
         handshakes = {}
+        transfer = {}
     cpu = cpu_percent()
     try:
         parts = Path("/proc/meminfo").read_text().splitlines()
@@ -96,7 +102,7 @@ def health():
         mem_str = f"{used}/{total}MB"
     except Exception:
         mem_str = "?"
-    return jsonify({"status": "ok", "peers": peers, "peer_keys": peer_keys, "handshakes": handshakes, "cpu": cpu, "mem": mem_str, "net": net_bytes()})
+    return jsonify({"status": "ok", "peers": peers, "peer_keys": peer_keys, "handshakes": handshakes, "transfer": transfer, "cpu": cpu, "mem": mem_str, "net": net_bytes()})
 
 
 @app.route("/api/obf-health")

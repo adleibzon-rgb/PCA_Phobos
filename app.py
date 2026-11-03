@@ -802,6 +802,7 @@ _last_fanout = 0
 _last_peer_sync = 0
 server_stats_cache = {}
 server_handshakes_cache = {}
+server_transfer_cache = {}   # server ip -> {pub: [rx, tx]} (from secondary /api/health)
 
 
 def count_client_peers():
@@ -889,6 +890,7 @@ def get_remote_stats(server):
             raise Exception("no response")
         # cache handshakes so page renders never block on remote HTTP
         server_handshakes_cache[server.get("ip", "")] = data.get("handshakes", {}) or {}
+        server_transfer_cache[server.get("ip", "")] = data.get("transfer", {}) or {}
         # Filter peers: only count known client public keys
         clients = get_clients()
         client_pubs = {c.get("public_key", "") for c in clients}
@@ -1751,6 +1753,71 @@ def finish_legacy_update():
 finish_legacy_update()
 threading.Thread(target=rate_sampler, daemon=True).start()
 
+# ---- Monthly traffic per client, summed over all servers; resets on the 1st ----
+# WireGuard counters live per server and drop to 0 on wg restart/reboot, so we add deltas.
+TRAFFIC_FILE = f"{PANEL_DIR}/traffic.json"
+_traffic_lock = threading.Lock()
+
+
+def _traffic_load():
+    try:
+        with open(TRAFFIC_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _local_transfer():
+    out = {}
+    try:
+        for line in subprocess.check_output(["wg", "show", "wg0", "dump"], text=True, timeout=5).strip().split("\n")[1:]:
+            p = line.split("\t")
+            if len(p) >= 7:
+                out[p[0]] = [int(p[5]), int(p[6])]
+    except Exception:
+        pass
+    return out
+
+
+def traffic_sample():
+    month = datetime.now().strftime("%Y-%m")
+    with _traffic_lock:
+        d = _traffic_load()
+        if d.get("month") != month:
+            if d.get("usage"):
+                d.setdefault("history", {})[d.get("month", "?")] = d["usage"]
+            d["month"], d["usage"] = month, {}
+        prev, usage = d.setdefault("prev", {}), d.setdefault("usage", {})
+        pub2cid = {c.get("public_key"): c.get("client_id") for c in get_clients() if c.get("public_key")}
+        srcs = {SERVER_IP: _local_transfer()}
+        srcs.update(server_transfer_cache)
+        for ip, counters in srcs.items():
+            for pub, (rx, tx) in counters.items():
+                key, old, cid = ip + "|" + pub, prev.get(ip + "|" + pub), pub2cid.get(pub)
+                prev[key] = [rx, tx]
+                if old is None or not cid:   # first sight = baseline only
+                    continue
+                u = usage.setdefault(cid, [0, 0])
+                u[0] += rx - old[0] if rx >= old[0] else rx   # counter went down = wg restarted
+                u[1] += tx - old[1] if tx >= old[1] else tx
+        tmp = TRAFFIC_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(d, f)
+        os.replace(tmp, TRAFFIC_FILE)
+
+
+def traffic_sampler():
+    time.sleep(20)
+    while True:
+        try:
+            traffic_sample()
+        except Exception:
+            pass
+        time.sleep(60)
+
+
+threading.Thread(target=traffic_sampler, daemon=True).start()
+
 
 PAGE = """<!DOCTYPE html>
 <html lang="ru">
@@ -2294,6 +2361,27 @@ def _terminal_button(url, title):
             f'style="background:#334155" title="{_html_attr(title)}">🖥️</a>')
 
 
+def _fmt_bytes(n):
+    for u in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if n < 1024 or u == "TiB":
+            return f"{n:.2f} {u}" if u != "B" else f"{int(n)} B"
+        n /= 1024
+
+
+def _traffic_cell(u):
+    if not u:
+        return "—"
+    return f"↓ {_fmt_bytes(u[1])} · ↑ {_fmt_bytes(u[0])}"   # server tx = client download
+
+
+@app.route("/api/traffic")
+@auth_required
+def api_traffic():
+    """Monthly traffic per client: current month + history ({client: [rx, tx]}, server-side bytes)."""
+    d = _traffic_load()
+    return jsonify({"month": d.get("month"), "usage": d.get("usage", {}), "history": d.get("history", {})})
+
+
 @app.route("/clients", methods=["GET", "POST"])
 @auth_required
 def clients_page():
@@ -2601,6 +2689,7 @@ def clients_page():
             <button class="btn btn-sm" style="background:#475569" type="submit">{tr("Имя","Name")}</button>
             </form>
         """
+        _tusage = _traffic_load().get("usage", {}) if "_tusage" not in dir() else _tusage
         lim = str(limits.get(cid, "") or "")
         rate = client_rates.get(pub)
         speed = (f'<span class="cspeed" title="{tr("Скорость сейчас","Current speed")}">↓{rate[0]:.1f} ↑{rate[1]:.1f} {tr("Мбит/с","Mbit/s")}</span>' if rate else "")
@@ -2613,7 +2702,7 @@ def clients_page():
             <button class="btn btn-primary btn-sm" type="submit">{set_lbl}</button>
             </form>"""
         rows += f"""<div class="ccard">
-        <div class="ctop"><span class="cname">{client_cell}</span> <span class="cip">{ip}</span> {status} {expiry_badge} {f'<span class="badge badge-lock">≤{_html_attr(lim)} Mbit</span>' if lim and lim != "0" else ""} {speed}</div>
+        <div class="ctop"><span class="cname">{client_cell}</span> <span class="cip">{ip}</span> {status} {expiry_badge} <span class="cspeed" title="{tr('Трафик за месяц (суммарно по всем серверам)','Traffic this month (all servers)')}">{_traffic_cell(_tusage.get(cid))}</span> {f'<span class="badge badge-lock">≤{_html_attr(lim)} Mbit</span>' if lim and lim != "0" else ""} {speed}</div>
         <div class="cctl">{server_cell}{expiry_cell}{limit_cell}{rename_box}</div>
         <div class="cact">{actions_cell}</div>
         </div>"""
