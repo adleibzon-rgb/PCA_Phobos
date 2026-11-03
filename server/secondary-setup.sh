@@ -27,9 +27,16 @@ SERVER_WG_IPV4_NETWORK="${SERVER_WG_IPV4_NETWORK:-10.25.0.0/16}"
 SERVER_WG_IPV4_NETWORK="$(python3 - "$SERVER_WG_IPV4_NETWORK" <<'PY'
 import ipaddress, sys
 try:
-    net = ipaddress.ip_network(sys.argv[1].strip(), strict=False)
+    net = ipaddress.ip_network(sys.argv[1].strip(), strict=True)
 except ValueError:
-    sys.exit("ERROR: bad subnet " + sys.argv[1])
+    # «10.25.11.0/16» — биты хоста заданы: раньше молча превращалось в 10.25.0.0/16
+    # (две установки с одинаковой подсетью → одинаковые IP клиентов, конфликт на роутере).
+    # Считаем, что нужна подсеть этого адреса, и берём /24.
+    try:
+        net = ipaddress.ip_network(sys.argv[1].strip().split("/")[0] + "/24", strict=False)
+        sys.stderr.write("NOTICE: subnet %s has host bits set, using %s\n" % (sys.argv[1], net))
+    except ValueError:
+        sys.exit("ERROR: bad subnet " + sys.argv[1])
 if net.version != 4 or not net.is_private or net.prefixlen > 29:
     sys.exit("ERROR: subnet must be private IPv4, /8../29 (e.g. 10.25.1.0/24)")
 print(net)

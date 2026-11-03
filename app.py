@@ -4479,6 +4479,26 @@ def servers_page():
     {nav('servers')}
     {msg}
 
+    <div class="card" style="border:2px solid var(--accent)">
+    <h2 style="font-size:1.25em">➕ {tr("Как добавить второй сервер", "How to add a second server")}</h2>
+    <p style="font-size:1em;font-weight:600;margin:6px 0">{tr("Сервер управления один — эта панель. Второй VPS ставится как «дополнительный» (secondary) одной командой.", "There is one management server — this panel. The second VPS is installed as a secondary with one command.")}</p>
+    <ol style="margin:8px 0 8px 20px;line-height:1.6;font-size:.95em">
+    <li>{tr("Возьмите чистый VPS (Ubuntu/Debian). Если на нём уже стоял Phobos целиком — сначала удалите его (uninstall.sh).", "Take a clean VPS (Ubuntu/Debian). If a full Phobos was installed there, uninstall it first (uninstall.sh).")}</li>
+    <li>{tr("Зайдите на него по SSH под root и выполните команду ниже.", "SSH to it as root and run the command below.")}</li>
+    <li><b>{tr("На вопрос «Подсеть VPN-клиентов» просто нажмите Enter", "At the “VPN clients subnet” prompt just press Enter")}</b> — {tr("подсеть должна быть такой же, как у этой панели (не вводите другую!).", "the subnet must be the same as on this panel (do not enter a different one!).")}</li>
+    <li>{tr("Сервер сам появится в списке ниже, клиенты скопируются на него автоматически. Кнопка «Добавить сервер» не нужна.", "The server appears in the list below by itself and clients are copied to it automatically. The “Add Server” button is not needed.")}</li>
+    <li>{tr("Назначить клиенту сервер: Клиенты → «Редактировать» → «Сервер». Наши приложения (роутер, iOS, Android, Windows 1.4.5+) переключатся сами; другие клиенты — только повторным импортом ссылки.", "Assign a server to a client: Clients → Edit → Server. Our apps (router, iOS, Android, Windows 1.4.5+) switch by themselves; other clients need the link re-imported.")}</li>
+    </ol>
+    <div style="display:flex;gap:8px;align-items:flex-start">
+    <code id="secCmd" style="background:var(--bg);padding:8px 12px;border-radius:6px;display:block;font-size:.82em;word-break:break-all;flex:1">MAIN_PROTO={panel_scheme()} MAIN_SERVER={SERVER_IP} MAIN_PORT={panel_port()} MAIN_API_KEY={api_key} bash &lt;(curl -kfsSL {panel_base_url()}/server/secondary-setup.sh)</code>
+    <button class="btn btn-primary btn-sm" type="button" onclick="var x=document.createElement('textarea');x.value=document.getElementById('secCmd').textContent;document.body.appendChild(x);x.select();document.execCommand('copy');document.body.removeChild(x);this.textContent='{tr("Скопировано","Copied")}'">📋 {tr("Копировать","Copy")}</button>
+    </div>
+    <div style="margin-top:12px;padding:10px 12px;border-radius:8px;background:rgba(245,158,11,.15);border:1px solid #f59e0b;font-size:.9em;line-height:1.5">
+    <b>⚠ {tr("Не ставьте второй сервер полным install.sh!", "Do not install the second server with the full install.sh!")}</b><br>
+    {tr("Полный install.sh создаёт ОТДЕЛЬНУЮ панель со своими клиентами. Подсеть там придётся указывать свою (например 10.25.11.0/24, иначе у клиентов будут одинаковые IP и второй туннель на роутере не поднимется), а смена сервера у клиента между двумя панелями НЕ работает — это разные клиенты. Нужна смена и назначение серверов — ставьте только командой выше, подсеть по умолчанию (Enter).", "The full install.sh creates a SEPARATE panel with its own clients. You would have to enter your own subnet there (e.g. 10.25.11.0/24, otherwise clients get identical IPs and the second router tunnel will not come up), and switching a client's server between two panels does NOT work — they are different clients. If you need server assignment and switching, use only the command above with the default subnet (Enter).")}
+    </div>
+    </div>
+
     <div class="card">
     <h2>{tr("Панель серверов", "Server Dashboard")} {hlp("Живая статистика всех VPN-серверов. Peers = активные WG-подключения. Assigned = клиенты, у которых этот сервер основной. Фоновый монитор опрашивает каждые " + str(s.get('monitor_interval',30)) + " сек и шлёт оповещения в Telegram при падении/восстановлении сервера.", "Live stats for all VPN servers. Peers = active WG connections. Assigned = clients whose primary is this server. Background monitor polls every " + str(s.get('monitor_interval',30)) + "s and sends Telegram alerts on server up/down.")}</h2>
     <div style="display:flex;gap:12px;flex-wrap:wrap">{stats_cards}</div>
@@ -4498,6 +4518,7 @@ def servers_page():
     <button class="btn btn-primary" type="submit" onclick="return confirm('{tr("Отправить конфиг на все роутеры?","Push config to all routers?")}')">Push All</button></form>
     {hlp("Принудительно отправить конфиг на роутеры с прямым SSH. Роутеры за NAT это игнорируют и сами подтягивают конфиг за ~15 сек — обычно эта кнопка не нужна.", "Force-push config to routers reachable by SSH. NAT routers ignore it and auto-pull within ~15s — you usually do not need this.")}
     </div>
+    <details style="margin-top:16px"><summary style="cursor:pointer;color:var(--muted)">{tr("Сервер уже поставлен, но не появился в списке? Добавить вручную", "Server installed but not in the list? Add manually")}</summary>
     <form method="post" class="form-row" style="margin-top:16px;flex-wrap:wrap">
     <input type="hidden" name="action" value="add">
     <input type="text" name="ip" placeholder="{tr('IP сервера','Server IP')}" required>
@@ -4508,6 +4529,7 @@ def servers_page():
     <button class="btn btn-primary" type="submit">{tr("Добавить сервер","Add Server")}</button>
     {hlp("Добавить новый VPN-сервер в пул резервирования. Если secondary ставился командой ниже, API key можно оставить пустым — будет использован главный ключ панели. 8444 — это порт mini-API, не ключ.", "Add a new VPN server to the failover pool. If the secondary was installed with the command below, API key may be left blank — the panel main key will be used. 8444 is the mini-API port, not the key.")}
     </form>
+    </details>
     </div>
 
     <div class="card">
@@ -4527,7 +4549,7 @@ def servers_page():
     </div>
 
     <div class="card">
-    <h2>Server SSH Access</h2>
+    <h2>{tr("SSH-доступ к серверам","Server SSH Access")}</h2>
     <p style="color:var(--muted);font-size:.85em;margin-bottom:12px">SSH credentials for secondary servers. Used by panel to add/remove WG peers when switching client servers. Main server uses local commands.</p>
     <form method="post">
     <input type="hidden" name="action" value="save_server_access">
@@ -4546,7 +4568,7 @@ def servers_page():
     </div>
 
     <div class="card">
-    <h2>API Key</h2>
+    <h2>{tr("API-ключ","API Key")}</h2>
     <form method="post" class="form-row">
     <input type="hidden" name="action" value="set_api_key">
     <input type="text" name="server_api_key" value="{api_key}" placeholder="API key" style="width:300px">
@@ -4554,11 +4576,6 @@ def servers_page():
     </form>
     </div>
 
-    <div class="card">
-    <h2>Deploy Secondary Server</h2>
-    <p style="color:var(--muted);font-size:.85em;margin-bottom:8px">One command deploys WG + obfuscator + mini-API on a new VPS. Auto-registers in panel. Run via SSH on new VPS:</p>
-    <code style="background:var(--bg);padding:8px 12px;border-radius:6px;display:block;font-size:.82em;word-break:break-all">MAIN_PROTO={panel_scheme()} MAIN_SERVER={SERVER_IP} MAIN_PORT={panel_port()} MAIN_API_KEY={api_key} bash &lt;(curl -kfsSL {panel_base_url()}/server/secondary-setup.sh)</code>
-    </div>
     </div>"""
     return render(html)
 if __name__ == "__main__":
