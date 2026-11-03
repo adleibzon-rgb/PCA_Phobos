@@ -460,10 +460,11 @@ deploy_health_monitor() {
     # (vixie, PROCS=cron) на Keenetic задачи не выполнял — заменяем (01.11.2026)
     local I=/opt/etc/init.d/S10cron
     if [ ! -x $I ] || grep -q "^PROCS=cron$" $I; then
-      $I stop >/dev/null 2>&1
+      [ -x $I ] && $I stop </dev/null >/dev/null 2>&1
       printf '#!/bin/sh\n\nENABLED=yes\nPROCS=crond\nARGS="-c /opt/var/spool/cron/crontabs -b"\nPREARGS=""\nDESC=$PROCS\nPATH=/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\n. /opt/etc/init.d/rc.func\n' > $I
       chmod +x $I
     fi
+    [ -x /opt/sbin/crond ] || command -v crond >/dev/null 2>&1 || log "  ВНИМАНИЕ: crond не найден — health/pull по расписанию работать не будут (opkg install cron или busybox с crond)"
     mkdir -p /opt/var/spool/cron/crontabs
     # 01.11.2026: демоны cron на Keenetic (busybox crond, Entware cron) читают crontab
     # пользователя root, а не /opt/etc/crontab — туда писать бесполезно
