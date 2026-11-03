@@ -21,8 +21,10 @@ echo "  watchdog, бинарники, $PHOBOS_DIR, $PANEL_DIR"
 echo "=================================================="
 if [ "${PURGE:-0}" != "1" ]; then
     printf "Точно удалить ВСЁ? [yes/NO]: "
-    read ans
-    [ "$ans" = "yes" ] || { echo "Отменено."; exit 0; }
+    read -r ans </dev/tty 2>/dev/null || read -r ans
+    # tolerate CR from Windows/phone terminals, spaces, case, "да"
+    ans=$(printf '%s' "$ans" | tr -d '\r[:space:]' | tr '[:upper:]' '[:lower:]')
+    case "$ans" in yes|y|да|д) ;; *) echo "Отменено (нужно ввести yes)."; exit 0 ;; esac
 fi
 
 IFACE=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1)}' | head -1)
