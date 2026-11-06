@@ -468,7 +468,7 @@ deploy_health_monitor() {
     mkdir -p /opt/var/spool/cron/crontabs
     # 01.11.2026: демоны cron на Keenetic (busybox crond, Entware cron) читают crontab
     # пользователя root, а не /opt/etc/crontab — туда писать бесполезно
-    sed -i "/phobos-health\|phobos-pull/d" /opt/etc/crontab 2>/dev/null
+    sed -i "/phobos-health\|phobos-pull/d" /opt/etc/crontab 2>/dev/null || true
     (crontab -l 2>/dev/null | grep -v "phobos-health" | grep -v "phobos-pull"; echo "$cron_line"; [ -n "$pull_line" ] && echo "$pull_line") | crontab -
     log "  Cron добавлен через crontab (health + pull)"
     /opt/etc/init.d/S10cron restart >/dev/null 2>&1 || true
