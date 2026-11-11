@@ -19,6 +19,7 @@
 #    OBF_PORTS    2083,5443,993        obfuscator listen ports
 #    TG_TOKEN / TG_CHAT                Telegram alerts
 #    PCA_BRANCH   main                 branch to pull PCA files from
+#    SKIP_NGINX   0                    1 = do not touch an existing nginx
 # ============================================================
 set -e
 
@@ -104,7 +105,8 @@ print(ipaddress.ip_network(sys.argv[1], strict=False).prefixlen)
 PY
 )"
 
-SERVER_IP=$(curl -s -m8 https://api.ipify.org || hostname -I | awk '{print $1}')
+# ponytail: SERVER_IP можно задать явно — для серверов с несколькими IP
+SERVER_IP="${SERVER_IP:-$(curl -s -m8 https://api.ipify.org || hostname -I | awk '{print $1}')}"
 IFACE=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1)}' | head -1)
 IFACE="${IFACE:-eth0}"
 ARCH=$(uname -m)
@@ -340,6 +342,8 @@ systemctl daemon-reload; systemctl enable phobos-panel -q; systemctl restart pho
 
 # ── 8. nginx (serve /init + /packages over plain HTTP for routers) ──
 echo "[8/9] nginx..."
+# ponytail: SKIP_NGINX=1 — на сервере уже есть свой nginx; /init и /packages отдаёт панель
+if [ "${SKIP_NGINX:-0}" = "1" ]; then echo "  skipped (SKIP_NGINX=1)"; else
 rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
 cat > /etc/nginx/sites-available/phobos <<'NGINX'
 server {
@@ -352,8 +356,9 @@ server {
 }
 NGINX
 ln -sf /etc/nginx/sites-available/phobos /etc/nginx/sites-enabled/phobos
-mkdir -p /opt/Phobos/www/app; chmod 755 /opt/Phobos/www /opt/Phobos/www/init /opt/Phobos/www/packages /opt/Phobos/www/app
 nginx -t >/dev/null 2>&1 && systemctl enable nginx -q 2>/dev/null && systemctl restart nginx || echo "  WARN: nginx config test failed"
+fi
+mkdir -p /opt/Phobos/www/app; chmod 755 /opt/Phobos/www /opt/Phobos/www/init /opt/Phobos/www/packages /opt/Phobos/www/app
 
 # ── 9. router watchdog (auto reboot-recovery) ──
 echo "[9/9] router watchdog..."

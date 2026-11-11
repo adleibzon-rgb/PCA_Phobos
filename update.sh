@@ -97,6 +97,7 @@ $PHOBOS_DIR/server/phobos-domain.sh|server/phobos-domain.sh
 $PHOBOS_DIR/server/phobos-limit.sh|server/phobos-limit.sh
 $PHOBOS_DIR/server/phobos-speedtest.sh|server/phobos-speedtest.sh
 $PHOBOS_DIR/server/phobos-tcp.sh|server/phobos-tcp.sh
+$PHOBOS_DIR/server/phobos-altip.sh|server/phobos-altip.sh
 $PHOBOS_DIR/server/update.sh|update.sh
 LIST
 }
@@ -113,6 +114,8 @@ ensure_tcp_fallback() {  # $1=ref ; primary only (secondaries have no panel)
     [ -x "$PHOBOS_DIR/server/phobos-tcp.sh" ] && ln -sf "$PHOBOS_DIR/server/phobos-tcp.sh" /usr/local/bin/phobos-tcp
     [ -x "$PHOBOS_DIR/bin/udptcp" ] && "$PHOBOS_DIR/server/phobos-tcp.sh" enable >/dev/null 2>&1 \
         && echo "TCP fallback: port $(grep '^TCP_PORT=' "$PHOBOS_DIR/server/server.env" | cut -d= -f2)" || true
+    # second IP answers from itself (09.33) — no-op on single-IP servers
+    [ -f "$PHOBOS_DIR/server/phobos-altip.sh" ] && sh "$PHOBOS_DIR/server/phobos-altip.sh" enable >/dev/null 2>&1 || true
 }
 
 run_self_check() {

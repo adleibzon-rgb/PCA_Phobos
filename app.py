@@ -8,7 +8,10 @@ import json, os, subprocess, threading, time, secrets, hashlib, re, fcntl, hmac,
 import html as html_lib
 from datetime import datetime, timedelta
 from pathlib import Path
-from flask import Flask, request, redirect, url_for, session, make_response, send_from_directory
+import urllib.request as _ur
+# git.bobyrev.com sits behind Cloudflare, which answers 403 to the default "Python-urllib" User-Agent (11.11.2026)
+_op = _ur.build_opener(); _op.addheaders = [("User-Agent", "PCA-Phobos-Panel")]; _ur.install_opener(_op)
+from flask import Flask, request, redirect, url_for, session, make_response, send_from_directory, jsonify
 try:
     from flask_sock import Sock
 except Exception:
@@ -37,7 +40,7 @@ WG_CONFIG = "/etc/wireguard/wg0.conf"
 # Distribution: Gitea first (GitHub account is unavailable since 23.10.2026), GitHub fallback
 PCA_GIT = "https://git.bobyrev.com/PCA/PCA_Phobos"
 PCA_GH_RAW = "https://raw.githubusercontent.com/adleibzon-rgb/PCA_Phobos"
-APK_TAG = "v1.4.4"
+APK_TAG = "v1.4.10"
 WARP_DIR = f"{PHOBOS_DIR}/server/warp"
 WARP_CUSTOM_PROFILE_FILE = f"{WARP_DIR}/custom-profile.conf"
 WARP_LICENSE_FILE = f"{WARP_DIR}/license.key"
@@ -53,6 +56,7 @@ else:
         f.write(app.secret_key)
 
 DEFAULT_SETTINGS = {
+    "client_fw": {},
     "admin_pass": "OcAdmin2026!",
     "tg_bot_token": "",
     "tg_chat_id": "",
@@ -73,6 +77,8 @@ DEFAULT_SETTINGS = {
         "max_dummy": "4",
         "idle": "300",
     },
+    "obf_presets": [],
+    "client_presets": {},
 }
 LOGIN_ATTEMPTS = {}
 LOGIN_WINDOW = 900
@@ -105,9 +111,12 @@ def save_settings(s):
 SRV_OBF_KEYS = ("masking", "max-dummy", "idle-timeout")
 
 
-def _srv_obf_confs():
+def _srv_obf_confs(include_presets=False):
     import glob
-    return sorted(glob.glob(f"{PHOBOS_DIR}/server/wg-obfuscator-*.conf"))
+    confs = sorted(glob.glob(f"{PHOBOS_DIR}/server/wg-obfuscator-*.conf"))
+    if include_presets:
+        return confs
+    return [f for f in confs if "# preset=" not in Path(f).read_text()]
 
 
 def read_server_obf():
@@ -138,6 +147,158 @@ def write_server_obf(vals):
         subprocess.run(["systemctl", "restart", f"wg-obfuscator-{port}"], timeout=30)
         done.append(port)
     return done
+
+
+# ---- Obfuscator presets: extra port+key sets on the primary server, picked per client ----
+def obf_preset_for(cid):
+    s = load_settings()
+    pid = s.get("client_presets", {}).get(cid)
+    for p in s.get("obf_presets", []):
+        if p["id"] == pid:
+            return p
+    return None
+
+
+def _preset_conf_text(p, port):
+    return (f"# preset={p['id']}\n[instance]\nsource-if = 0.0.0.0\nsource-lport = {port}\n"
+            f"target = 127.0.0.1:51820\nkey = {p['key']}\nmasking = {p['masking']}\nverbose = INFO\n"
+            f"idle-timeout = {p['idle']}\nmax-dummy = {p['max_dummy']}\n")
+
+
+def apply_obf_presets():
+    """Write conf+systemd unit for every preset port, start them, drop units of removed presets."""
+    import glob
+    presets = load_settings().get("obf_presets", [])
+    want = {}
+    for p in presets:
+        for port in p["ports"].split(","):
+            want[port.strip()] = p
+    for f in glob.glob(f"{PHOBOS_DIR}/server/wg-obfuscator-*.conf"):
+        port = re.search(r"wg-obfuscator-(\d+)\.conf$", f).group(1)
+        if "# preset=" in Path(f).read_text() and port not in want:
+            subprocess.run(["systemctl", "disable", "--now", f"wg-obfuscator-{port}"], timeout=30)
+            os.remove(f)
+            try:
+                os.remove(f"/etc/systemd/system/wg-obfuscator-{port}.service")
+            except OSError:
+                pass
+    for port, p in want.items():
+        Path(f"{PHOBOS_DIR}/server/wg-obfuscator-{port}.conf").write_text(_preset_conf_text(p, port))
+        Path(f"/etc/systemd/system/wg-obfuscator-{port}.service").write_text(
+            f"[Unit]\nDescription=WireGuard Obfuscator (preset {p['name']}, port {port})\n"
+            "After=network.target wg-quick@wg0.service\n[Service]\nType=simple\n"
+            f"ExecStart=/usr/local/bin/wg-obfuscator --config {PHOBOS_DIR}/server/wg-obfuscator-{port}.conf\n"
+            "Restart=always\nRestartSec=5\n[Install]\nWantedBy=multi-user.target\n")
+    subprocess.run(["systemctl", "daemon-reload"], timeout=30)
+    for port in want:
+        subprocess.run(["systemctl", "enable", f"wg-obfuscator-{port}"], timeout=30, capture_output=True)
+        subprocess.run(["systemctl", "restart", f"wg-obfuscator-{port}"], timeout=30)
+
+
+def add_obf_preset(name, ports, masking, max_dummy, idle):
+    """Returns (ok, message). Ports must be free and not used by the panel, WG, defaults or other presets."""
+    s = load_settings()
+    name = (name or "").strip()[:32]
+    if not re.match(r"^[\w .-]+$", name):
+        return False, "Имя пресета: буквы, цифры, пробел, . _ -"
+    try:
+        plist = [int(x) for x in re.split(r"[,\s]+", ports.strip()) if x]
+        masking = masking.upper() if masking.upper() in ("AUTO", "STUN", "NONE") else "AUTO"
+        max_dummy = str(min(255, max(0, int(max_dummy or 4))))
+        idle = str(min(3600, max(10, int(idle or 300))))
+    except ValueError:
+        return False, "Порты и числа — только цифры."
+    if not plist or any(not 1024 <= x <= 65535 for x in plist):
+        return False, "Порты: 1024–65535."
+    env = _load_server_env()
+    busy = {int(x) for x in re.split(r"[,\s]+", env.get("OBFUSCATOR_PORTS", "")) if x.isdigit()}
+    busy |= {51820, int(panel_port()), int(env.get("TCP_PORT") or 0)}
+    for p in s["obf_presets"]:
+        busy |= {int(x) for x in p["ports"].split(",")}
+    if busy & set(plist):
+        return False, "Порт занят: " + ",".join(str(x) for x in sorted(busy & set(plist)))
+    s["obf_presets"].append({"id": secrets.token_hex(3), "name": name, "ports": ",".join(map(str, plist)),
+                             "key": secrets.token_urlsafe(24)[:32].replace("-", "x").replace("_", "y"),
+                             "masking": masking, "max_dummy": max_dummy, "idle": idle})
+    save_settings(s)
+    apply_obf_presets()
+    return True, "Пресет добавлен, порты запущены."
+
+
+def del_obf_preset(pid):
+    s = load_settings()
+    s["obf_presets"] = [p for p in s["obf_presets"] if p["id"] != pid]
+    moved = [c for c, v in s.get("client_presets", {}).items() if v == pid]
+    for c in moved:
+        s["client_presets"].pop(c, None)
+    save_settings(s)
+    apply_obf_presets()
+    for c in moved:
+        try:
+            fanout_router_config(c)
+        except Exception:
+            pass
+    return len(moved)
+
+
+# ---- Per-client firewall: allow-list of destinations, everything else from that client is dropped ----
+FW_CHAIN = "PHOBOS_CLIENTS"
+
+
+def parse_fw_list(text):
+    """'1.1.1.1, 10.0.0.0/8, 8.8.8.8:53/udp, 93.184.216.34:443' -> [(net, port|None, proto|None)]. Raises ValueError."""
+    import ipaddress
+    out = []
+    for raw in re.split(r"[,\s]+", (text or "").strip()):
+        if not raw:
+            continue
+        proto = None
+        m = re.match(r"^(.*)/(tcp|udp)$", raw)
+        if m:
+            raw, proto = m.groups()
+        port = None
+        if ":" in raw:
+            raw, _, ps = raw.partition(":")
+            if not ps.isdigit() or not 1 <= int(ps) <= 65535:
+                raise ValueError(raw + ":" + ps)
+            port = int(ps)
+        if (port or proto) and proto is None:
+            proto = "tcp"
+        net = ipaddress.ip_network(raw, strict=False)
+        if net.version != 4:
+            raise ValueError(raw + " (IPv4 only)")
+        out.append((str(net), port, proto))
+    return out
+
+
+def apply_client_fw():
+    """Rebuild the PHOBOS_CLIENTS chain from settings; clients without a list stay unrestricted."""
+    fw = load_settings().get("client_fw", {})
+    ips = {c.get("client_id"): (c.get("tunnel_ip_v4") or "").split("/")[0] for c in get_clients()}
+
+    def ipt(*a):
+        return subprocess.run(["iptables", *a], capture_output=True, timeout=15).returncode
+
+    ipt("-N", FW_CHAIN)
+    ipt("-F", FW_CHAIN)
+    for cid, text in fw.items():
+        src = ips.get(cid)
+        if not src or not text.strip():
+            continue
+        try:
+            entries = parse_fw_list(text)
+        except ValueError:
+            continue
+        for net, port, proto in entries:
+            rule = ["-A", FW_CHAIN, "-s", src, "-d", net]
+            if proto:
+                rule += ["-p", proto]
+                if port:
+                    rule += ["--dport", str(port)]
+            ipt(*rule, "-j", "ACCEPT")
+        ipt("-A", FW_CHAIN, "-s", src, "-j", "DROP")
+    if ipt("-C", "FORWARD", "-i", "wg0", "-j", FW_CHAIN) != 0:
+        ipt("-I", "FORWARD", "1", "-i", "wg0", "-j", FW_CHAIN)
 
 
 def _load_server_env():
@@ -378,6 +539,7 @@ def delete_client_cli(cid):
     try:
         st = load_settings()
         st.get("client_assignments", {}).pop(cid, None)
+        st.get("client_pinned", {}).pop(cid, None)
         st.get("client_notify", {}).pop(cid, None)
         save_settings(st)
     except Exception:
@@ -1006,9 +1168,12 @@ def generate_failover_conf_for_client(client_id):
     ordered = []
     if assigned_ip in by_ip:
         ordered.append(by_ip[assigned_ip])
-    for sv in all_servers:
-        if sv["ip"] != assigned_ip:
-            ordered.append(sv)
+    # 02.11.2026: «Только этот сервер» — учётка без перехода (несколько учёток на
+    # одном роутере = несколько выходов: каждая закреплена за своей страной)
+    if not (s.get("client_pinned", {}).get(client_id) and ordered):
+        for sv in all_servers:
+            if sv["ip"] != assigned_ip:
+                ordered.append(sv)
 
     # Get main server WG public key
     try:
@@ -1016,22 +1181,88 @@ def generate_failover_conf_for_client(client_id):
     except Exception:
         main_wg_pub = ""
 
+    tcp_port = str(_load_server_env().get("TCP_PORT", "") or "").strip()
     lines = ["# Phobos Failover Configuration"]
-    for i, srv in enumerate(ordered, 1):
-        lines.append(f"SERVER_{i}={client_endpoint(srv['ip'])}:{srv.get('ports', '2083,5443,993')}")
-        lines.append(f"KEY_{i}={srv.get('obfuscator_key', '')}")
+    i = 0
+    for srv in ordered:
+        pr = obf_preset_for(client_id) if srv.get("is_primary") else None
         wg_pub = main_wg_pub if srv.get("is_primary") else srv.get("wg_public_key", "")
-        if wg_pub:
-            lines.append(f"WGKEY_{i}={wg_pub}")
+        # every address of the server = its own entry: router hops address × port, then TCP
+        for host in [client_endpoint(srv["ip"])] + alt_endpoints(srv["ip"]):
+            i += 1
+            lines.append(f"SERVER_{i}={host}:{pr['ports'] if pr else srv.get('ports', '2083,5443,993')}")
+            lines.append(f"KEY_{i}={pr['key'] if pr else srv.get('obfuscator_key', '')}")
+            if wg_pub:
+                lines.append(f"WGKEY_{i}={wg_pub}")
+            tp = tcp_port if srv.get("is_primary") else str(srv.get("tcp_port", "") or "")
+            if tp.isdigit() and int(tp) > 0:
+                lines.append(f"TCP_{i}={tp}")
     # Obfuscator params (delivered live; router applies to wg-obfuscator.conf)
-    obf = s.get("obf_params", {})
+    obf = obf_preset_for(client_id) or s.get("obf_params", {})
     masking = (obf.get("masking") or "AUTO").upper()
     if masking not in ("AUTO", "STUN", "NONE"):
         masking = "AUTO"
+    # extra public panel URLs (alt IPs of this server): pull falls back to them when the
+    # tunnel and the main IP are both cut (09.33)
+    _purls = [f"http://{h}:{panel_port()}" for h in alt_endpoints(SERVER_IP)]
+    if _purls:
+        lines.append("PANEL_URLS_EXTRA=" + " ".join(_purls))
     lines.append(f"OBF_MASKING={masking}")
     lines.append(f"OBF_MAX_DUMMY={obf.get('max_dummy', '4')}")
     lines.append(f"OBF_IDLE={obf.get('idle', '300')}")
     return "\n".join(lines) + "\n"
+
+
+def phone_sub_token(cid):
+    """Stateless per-client token for the phone subscription (HMAC of the panel key)."""
+    import hmac, hashlib
+    key = (load_settings().get("server_api_key") or "").encode()
+    return hmac.new(key, ("phonesub:" + cid).encode(), hashlib.sha256).hexdigest()[:32]
+
+
+def phone_sub_servers(cid):
+    """Ordered server list for a phone: the assigned server first (same order as failover.conf)."""
+    s = load_settings()
+    assigned = s.get("client_assignments", {}).get(cid, SERVER_IP)
+    allv = get_all_servers_ordered()
+    ordered = [sv for sv in allv if sv["ip"] == assigned]
+    if not (s.get("client_pinned", {}).get(cid) and ordered):
+        ordered += [sv for sv in allv if sv["ip"] != assigned]
+    try:
+        main_wg_pub = subprocess.check_output(["wg", "show", "wg0", "public-key"], text=True, timeout=5).strip()
+    except Exception:
+        main_wg_pub = ""
+    tcp_port = _load_server_env().get("TCP_PORT", "")
+    out = []
+    for sv in ordered:
+        prim = bool(sv.get("is_primary"))
+        pr = obf_preset_for(cid) if prim else None
+        ports = (pr["ports"] if pr else sv.get("ports", "2083,5443,993"))
+        out.append({
+            "host": client_endpoint(sv["ip"]),
+            "port": int(str(ports).split(",")[0]),
+            "key": pr["key"] if pr else sv.get("obfuscator_key", ""),
+            "wg_pub": main_wg_pub if prim else sv.get("wg_public_key", ""),
+            "tcp": int(tcp_port) if (prim and str(tcp_port).isdigit()) else 0,
+        })
+    # IPv6 entries go last: phones whose operator cuts IPv4 to the server still get in.
+    # The server side listens via phobos-v6relay (the obfuscator itself is IPv4-only).
+    for sv, o in zip(ordered, list(out)):
+        v6 = (s.get("ipv6") if sv.get("is_primary") else sv.get("ipv6")) or ""
+        if v6:
+            out.append(dict(o, host=v6, tcp=0, ipv6=True))
+    return [o for o in out if o["key"] and o["wg_pub"]]
+
+
+@app.route("/api/phone-sub/<cid>")
+def phone_sub(cid):
+    """Phone subscription: the app pulls the server list and fails over between servers by itself."""
+    import hmac
+    if not hmac.compare_digest(request.args.get("token", ""), phone_sub_token(cid)):
+        return ("forbidden", 403)
+    if not any(c.get("client_id") == cid for c in get_clients()):
+        return ("not found", 404)
+    return jsonify({"servers": phone_sub_servers(cid)})
 
 
 def panel_version():
@@ -1152,6 +1383,47 @@ def run_update(arg):
         return prefix + "update error: " + str(e)
 
 
+UPDATE_LOG = "/tmp/phobos-update.log"
+
+
+def start_update_job(arg):
+    """Run the updater detached from the panel (it restarts the panel at the end). Returns (ok, message)."""
+    if not re.match(r"^(--check|--rollback|[A-Za-z0-9._/-]{1,40})$", arg):
+        return False, "bad target"
+    st = update_job_status()
+    if st["running"]:
+        return False, "update already running"
+    runner = _find_update_runner()
+    if not runner:
+        ok, note = _restore_update_script(_current_update_ref(arg))
+        runner = _find_update_runner() if ok else None
+    if not runner:
+        return False, f"update helper not found ({UPDATE_SCRIPT})"
+    Path(UPDATE_LOG).write_text(f"__START__ {arg}\n")
+    cmd = f'"{runner}" "{arg}" >> {UPDATE_LOG} 2>&1; echo "__EXIT__ $?" >> {UPDATE_LOG}'
+    try:
+        if shutil.which("systemd-run"):
+            subprocess.run(["systemd-run", "--collect", f"--unit=phobos-update-{int(time.time())}", "bash", "-c", cmd],
+                           capture_output=True, timeout=15, check=True)
+        else:
+            subprocess.Popen(["bash", "-c", cmd], start_new_session=True)
+    except Exception as e:
+        return False, "start failed: " + str(e)[:200]
+    return True, "started"
+
+
+def update_job_status():
+    try:
+        txt = Path(UPDATE_LOG).read_text(errors="replace")
+        age = time.time() - os.path.getmtime(UPDATE_LOG)
+    except Exception:
+        return {"running": False, "started": False, "log": "", "rc": None, "version": panel_version()}
+    m = re.search(r"__EXIT__ (\d+)", txt)
+    running = (not m) and age < 600
+    return {"running": running, "started": "__START__" in txt, "rc": int(m.group(1)) if m else None,
+            "log": re.sub(r"__(START|EXIT)__[^\n]*\n?", "", txt)[-3000:], "version": panel_version()}
+
+
 def warp_status():
     try:
         r = subprocess.run(
@@ -1186,6 +1458,13 @@ def script_status(name):
         return json.loads(out.strip().splitlines()[-1])
     except Exception:
         return {}
+
+
+def alt_endpoints(ip):
+    """Backup hosts for server `ip` (second IP, domains, cascade entries): the router
+    tries each of them on every port before moving to the next server (09.33)."""
+    v = load_settings().get("alt_endpoints", {}).get(ip, [])
+    return [x for x in v if isinstance(x, str) and x.strip()]
 
 
 def client_endpoint(ip):
@@ -1239,6 +1518,17 @@ def save_client_endpoints(form):
         if v and v != ip:
             eps[ip] = v
     s["endpoints"] = eps
+    alts = {}
+    for srv in get_all_servers_ordered():
+        ip = srv["ip"]
+        items = [x.strip() for x in (form.get("alt_" + ip, "") or "").replace(";", ",").split(",") if x.strip()]
+        for v in items:
+            if not _HOST_RE.match(v):
+                return False, tr("Неверный адрес: ", "Bad host: ") + v
+        items = [v for v in dict.fromkeys(items) if v not in (ip, eps.get(ip))]
+        if items:
+            alts[ip] = items[:5]
+    s["alt_endpoints"] = alts
     save_settings(s)
     # new client packages read CLIENT_ENDPOINT from server.env
     try:
@@ -1545,16 +1835,36 @@ def build_phone_config(cid, mode="android"):
             ("target = " + _swap_host(ln.split("=", 1)[1].strip(), client_endpoint))
             if ln.strip().startswith("target") and "=" in ln else ln
             for ln in inst.split("\n"))
+        pr = obf_preset_for(cid)
+        if pr:
+            inst = _apply_preset_to_inst(inst, pr)
         tcp_port = _load_server_env().get("TCP_PORT", "")
         if tcp_port and "pca-tcp" not in inst:
             # comment: PhobosWG/wg-obfuscator ignore it, PCA Phobos VPN uses it for the TCP fallback
             inst += "\n# pca-tcp = " + tcp_port
+        inst += "\n# pca-sub = %s/api/phone-sub/%s?token=%s" % (panel_base_url(client_endpoint(SERVER_IP)), cid, phone_sub_token(cid))
     conf = wg + "\n\n" + inst + "\n"
     payload = _prepare_phoboswg_payload(conf)
     # spec 2.1: base64url WITHOUT padding (HydraRoute rejects a trailing "=")
     b64 = base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
     link = "phobos://" + b64 + "#" + urllib.parse.quote(cid or "none")
     return payload, link
+
+
+def _apply_preset_to_inst(inst, pr):
+    """Point a client's [instance] at an obfuscator preset (primary server only)."""
+    vals = {"key": pr["key"], "masking": pr["masking"], "idle-timeout": pr["idle"], "max-dummy": pr["max_dummy"]}
+    out = []
+    for ln in inst.split("\n"):
+        k, eq, v = ln.partition("=")
+        k = k.strip()
+        if eq and k in vals:
+            ln = f"{k} = {vals[k]}"
+        elif eq and k == "target":
+            host = v.strip().rsplit(":", 1)[0]
+            ln = f"target = {host}:{pr['ports'].split(',')[0]}"
+        out.append(ln)
+    return "\n".join(out)
 
 
 def _prepare_phoboswg_payload(conf):
@@ -1820,6 +2130,7 @@ def session_monitor():
             if time.time() - _last_peer_sync >= 300:
                 _last_peer_sync = time.time()
                 sync_missing_peers_to_secondaries()
+                apply_client_fw()
                 if load_settings().get("speed_limits"):
                     apply_speed_limits()
             elif limits_need_reapply():
@@ -1868,6 +2179,111 @@ def finish_legacy_update():
 
 finish_legacy_update()
 threading.Thread(target=rate_sampler, daemon=True).start()
+
+
+# ---- Server stats for the dashboard (Linux /proc, no extra deps) ----
+import collections, shutil
+PANEL_START = time.time()
+STATS_HIST = collections.deque(maxlen=150)   # one sample per 2 s -> last 5 min
+
+
+def _proc_cpu():
+    v = [int(x) for x in open("/proc/stat").readline().split()[1:]]
+    return v[3] + (v[4] if len(v) > 4 else 0), sum(v)
+
+
+def _meminfo():
+    d = {}
+    for ln in open("/proc/meminfo"):
+        k, _, v = ln.partition(":")
+        d[k] = int(v.split()[0]) * 1024
+    return d
+
+
+def _iface_bytes(name):
+    for ln in open("/proc/net/dev"):
+        if ln.strip().startswith(name + ":"):
+            f = ln.split(":", 1)[1].split()
+            return int(f[0]), int(f[8])
+    return 0, 0
+
+
+def stats_sampler():
+    prev_cpu, prev_net, prev_t = _proc_cpu(), None, time.time()
+    while True:
+        time.sleep(2)
+        try:
+            now = time.time()
+            idle, total = _proc_cpu()
+            dcpu = total - prev_cpu[1]
+            cpu = round(100.0 * (1 - (idle - prev_cpu[0]) / dcpu), 1) if dcpu > 0 else 0.0
+            prev_cpu = (idle, total)
+            rx, tx = _iface_bytes("wg0")
+            rx_bps = tx_bps = 0.0
+            if prev_net is not None and now > prev_t:
+                rx_bps = max(0, rx - prev_net[0]) / (now - prev_t)
+                tx_bps = max(0, tx - prev_net[1]) / (now - prev_t)
+            prev_net, prev_t = (rx, tx), now
+            m = _meminfo()
+            ram_total = m.get("MemTotal", 0)
+            ram_used = ram_total - m.get("MemAvailable", 0)
+            sw_total = m.get("SwapTotal", 0)
+            sw_used = sw_total - m.get("SwapFree", 0)
+            du = os.statvfs("/")
+            d_total = du.f_blocks * du.f_frsize
+            d_used = d_total - du.f_bavail * du.f_frsize
+            STATS_HIST.append({"t": int(now), "cpu": cpu, "ram": ram_used, "ram_t": ram_total,
+                               "swap": sw_used, "swap_t": sw_total, "disk": d_used, "disk_t": d_total,
+                               "rx": round(rx_bps), "tx": round(tx_bps)})
+        except Exception:
+            pass
+
+
+def _proc_rss_threads(pid="self"):
+    rss = thr = 0
+    try:
+        for ln in open(f"/proc/{pid}/status"):
+            if ln.startswith("VmRSS:"):
+                rss = int(ln.split()[1]) * 1024
+            elif ln.startswith("Threads:"):
+                thr = int(ln.split()[1])
+    except Exception:
+        pass
+    return rss, thr
+
+
+def sys_info():
+    obf_rss = obf_n = 0
+    for pid in os.listdir("/proc"):
+        if pid.isdigit():
+            try:
+                if open(f"/proc/{pid}/comm").read().strip() == "wg-obfuscator":
+                    obf_rss += _proc_rss_threads(pid)[0]
+                    obf_n += 1
+            except Exception:
+                pass
+    rss, thr = _proc_rss_threads()
+    try:
+        os_up = float(open("/proc/uptime").read().split()[0])
+    except Exception:
+        os_up = 0
+    rx, tx = _iface_bytes("wg0")
+    return {"cores": os.cpu_count() or 1, "os_up": int(os_up), "panel_up": int(time.time() - PANEL_START),
+            "panel_rss": rss, "threads": thr, "obf_rss": obf_rss, "obf_n": obf_n,
+            "wg_rx": rx, "wg_tx": tx, "ip": SERVER_IP, "wg_addr": server_tunnel_addr()}
+
+
+def server_tunnel_addr():
+    try:
+        for ln in open("/etc/wireguard/wg0.conf"):
+            if ln.strip().startswith("Address"):
+                return ln.split("=", 1)[1].split(",")[0].strip().split("/")[0]
+    except Exception:
+        pass
+    return ""
+
+
+threading.Thread(target=stats_sampler, daemon=True).start()
 
 # ---- Monthly traffic per client, summed over all servers; resets on the 1st ----
 # WireGuard counters live per server and drop to 0 on wg restart/reboot, so we add deltas.
@@ -1944,8 +2360,8 @@ PAGE = """<!DOCTYPE html>
 <script>(function(){var t;try{t=localStorage.getItem('theme')}catch(e){}if(!t)t=matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light';document.documentElement.dataset.theme=t})();
 function toggleTheme(){var t=document.documentElement.dataset.theme==='dark'?'light':'dark';document.documentElement.dataset.theme=t;try{localStorage.setItem('theme',t)}catch(e){}}</script>
 <style>
-:root{--bg:#f1f5f9;--card:#ffffff;--border:#dbe2ea;--text:#0f172a;--muted:#64748b;--accent:#4338ca;--hover:#f8fafc;--navact:#e0e7ff;--err:#b91c1c;--warn:#b45309;color-scheme:light}
-:root[data-theme="dark"]{--bg:#0f172a;--card:#1e293b;--border:#334155;--text:#e2e8f0;--muted:#94a3b8;--accent:#a5b4fc;--hover:#262f3d;--navact:#312e81;--err:#fca5a5;--warn:#fcd34d;color-scheme:dark}
+:root{--bg:#eef2f9;--card:#ffffff;--border:#dde4ee;--text:#0f172a;--muted:#64748b;--accent:#2563eb;--hover:#f6f8fc;--navact:#e3ecfd;--err:#b91c1c;--warn:#b45309;--side:#ffffff;color-scheme:light}
+:root[data-theme="dark"]{--bg:#090c12;--card:#12161d;--border:#232933;--text:#e5e9f0;--muted:#8b95a7;--accent:#5b9dff;--hover:#181d26;--navact:#16233b;--err:#fca5a5;--warn:#fcd34d;--side:#0b0e14;color-scheme:dark}
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
 .header{background:linear-gradient(135deg,#1e1b4b,#312e81);padding:20px;text-align:center;border-bottom:2px solid #4f46e5}
@@ -2023,9 +2439,110 @@ textarea::placeholder{color:var(--muted)}
   .card{padding:14px}
   .nav{flex-wrap:wrap;justify-content:center;padding-bottom:4px}
 }
+
+/* --- 1.4.5 layout: sidebar + topbar --- */
+.header,.nav{display:none}
+.app{display:flex;min-height:100vh}
+.side{width:200px;flex:0 0 200px;background:var(--side);border-right:1px solid var(--border);display:flex;flex-direction:column;position:sticky;top:0;height:100vh;padding:14px 10px}
+.logo{display:flex;align-items:center;gap:8px;padding:6px 8px 18px;font-weight:700;letter-spacing:.14em;color:var(--accent);font-size:.92em;white-space:nowrap}
+.logo small{font-weight:500;letter-spacing:0;color:var(--muted);font-size:.66em;margin-left:auto}
+.side a.it{display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:8px;color:var(--muted);text-decoration:none;font-size:.9em;margin-bottom:2px;border-left:3px solid transparent}
+.side a.it:hover{background:var(--hover);color:var(--text)}
+.side a.it.on{background:var(--navact);color:var(--accent);border-left-color:var(--accent)}
+.side a.it svg{width:17px;height:17px;flex:0 0 17px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.side .cnt{margin-left:auto;background:var(--navact);color:var(--accent);border-radius:10px;font-size:.72em;padding:1px 7px}
+.side .sp{flex:1}
+.main{flex:1;min-width:0;display:flex;flex-direction:column}
+.top{display:flex;align-items:center;justify-content:space-between;padding:0 22px;height:56px;border-bottom:1px solid var(--border);background:var(--side);position:sticky;top:0;z-index:5}
+.top h1{font-size:1.02em;font-weight:600}
+.tb{display:flex;gap:8px}
+.tb a{width:34px;height:34px;border-radius:50%;border:1px solid var(--border);display:flex;align-items:center;justify-content:center;color:var(--text);text-decoration:none;font-size:.78em;font-weight:600;background:var(--card)}
+.tb a:hover{border-color:var(--accent);color:var(--accent)}
+.noside .side,.noside .top{display:none}
+.main .container{width:100%;max-width:1500px;margin:18px auto}
+.btn-primary{background:var(--accent);color:#fff}.btn-primary:hover{filter:brightness(.92)}
+.card{border-radius:14px}
+.card h2{border-bottom:none;text-transform:uppercase;font-size:.72em;letter-spacing:.09em;color:var(--muted);font-weight:600;margin-bottom:10px;padding-bottom:0}
+th{text-transform:uppercase;letter-spacing:.06em;font-size:.68em;font-weight:700}
+.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:16px}
+.stat{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:14px 16px}
+.stat .k{font-size:.7em;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);display:flex;gap:6px;align-items:center}
+.stat .v{font-size:1.9em;font-weight:700;margin:4px 0 0}.stat .v small{font-size:.5em;font-weight:600;color:var(--muted)}
+.stat .s{font-size:.78em;color:var(--muted);margin-bottom:6px}
+.stat .m{display:flex;justify-content:space-between;font-size:.62em;color:var(--muted);letter-spacing:.04em;text-transform:uppercase}
+.stat svg{width:100%;height:46px;display:block;margin-top:2px}
+.sess-wrap{display:flex;gap:26px;align-items:center}
+.sess-wrap .donut{flex:0 0 190px;position:relative}
+.donut svg{width:190px;height:190px;transform:rotate(-90deg)}
+.donut .c{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center}
+.donut .c b{font-size:1.15em}.donut .c span{font-size:.68em;color:var(--muted)}
+.sess-wrap .tbl{flex:1;min-width:0;overflow-x:auto}
+.dot{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:8px;vertical-align:middle}
+.chart{width:100%;height:260px;display:block}
+.legend{display:flex;gap:16px;justify-content:center;font-size:.8em;margin:6px 0;color:var(--muted)}
+.legend label{cursor:pointer;display:flex;gap:6px;align-items:center}
+.legend i{width:13px;height:13px;border:2px solid;border-radius:3px;display:inline-block}
+.legend .off i{background:transparent!important;opacity:.4}
+.sumrow{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;border-top:1px solid var(--border);margin-top:10px;padding-top:12px;font-size:.78em}
+.sumrow div span{display:block;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;font-size:.82em}
+.sumrow b{font-size:1.2em}
+.info4{display:grid;grid-template-columns:repeat(4,1fr);gap:0}
+.info4>div{padding:6px 18px;border-left:1px solid var(--border)}.info4>div:first-child{border-left:none;padding-left:0}
+.info4 .k{font-size:.7em;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
+.info4 .big{font-size:1.5em;font-weight:700}.info4 .sm{font-size:.74em;color:var(--muted)}
+.info4 .two{display:flex;gap:22px}
+@media (max-width:900px){
+  .app{flex-direction:column}.side{position:static;width:100%;height:auto;flex:none;flex-direction:row;overflow-x:auto;padding:6px;border-right:none;border-bottom:1px solid var(--border)}
+  .logo,.side .sp{display:none}.side a.it{white-space:nowrap;border-left:none}
+  .grid4,.info4{grid-template-columns:1fr 1fr}.sess-wrap{flex-direction:column}.top{padding:0 12px}
+}
+
+/* --- clients table + modals --- */
+.badge-on{background:rgba(34,197,94,.14);color:#16a34a;border:1px solid rgba(34,197,94,.35)}
+:root[data-theme="dark"] .badge-on{color:#4ade80}
+.badge-off{background:var(--hover);color:var(--muted);border:1px solid var(--border)}
+.chead{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:10px}
+.cnt2{background:var(--navact);color:var(--accent);border-radius:10px;font-size:.75em;padding:1px 8px;margin-left:6px}
+.ctable th{padding:12px 10px}.ctable td{padding:12px 10px;vertical-align:middle}
+.ctable.blur td.srv{filter:blur(6px);user-select:none}
+.cip{color:var(--muted);font-size:.8em;font-family:Menlo,monospace}
+.sw{width:34px;height:19px;border-radius:12px;border:none;background:var(--border);position:relative;cursor:pointer;padding:0}
+.sw::after{content:"";position:absolute;top:2px;left:2px;width:15px;height:15px;border-radius:50%;background:#fff;transition:left .15s}
+.sw.on{background:var(--accent)}.sw.on::after{left:17px}
+.acts{display:flex;gap:4px;align-items:center}
+.ib{width:30px;height:30px;border:none;background:transparent;color:var(--muted);border-radius:7px;cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0}
+.ib:hover{background:var(--hover);color:var(--accent)}.ib.danger:hover{color:#ef4444}
+.ib svg{width:17px;height:17px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:50;align-items:center;justify-content:center;padding:16px}
+.modal.show{display:flex}
+.mbox{background:var(--card);color:var(--text);border-radius:14px;width:100%;max-width:460px;max-height:92vh;overflow:auto;box-shadow:0 20px 60px rgba(0,0,0,.4)}
+.mbox.wide{max-width:760px}
+.mh{display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid var(--border)}
+.mh h3{font-size:1.05em}.x{border:none;background:none;font-size:1.5em;color:var(--muted);cursor:pointer;line-height:1}
+.mb{padding:16px 20px;display:block}
+.mb label{display:block;font-size:.85em;font-weight:600;margin-bottom:12px}
+.mb label input,.mb label select,.mb label textarea{display:block;width:100%;margin-top:6px;font-weight:400;padding:9px 12px}
+.mb .two{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.mf{display:flex;justify-content:flex-end;gap:10px;padding-top:6px}
+.merr{color:var(--err);font-size:.82em;min-height:1em;margin-bottom:6px}
+.tabs{display:flex;border-bottom:1px solid var(--border)}
+.tabs a{flex:1;text-align:center;padding:12px;cursor:pointer;color:var(--muted);border-bottom:2px solid transparent}
+.tabs a.on{color:var(--accent);border-bottom-color:var(--accent);font-weight:600}
+.conn .card{border:none;padding:0;margin:0;background:transparent;text-align:left!important}
+.conn img{float:left;margin:0 18px 10px 0;max-width:230px!important;border-radius:12px;border:1px solid var(--border)}
+.conn textarea{width:100%;clear:both}
+a.opt{display:flex;align-items:center;gap:14px;padding:14px;border:1px solid var(--border);border-radius:12px;margin-bottom:10px;text-decoration:none;color:var(--text)}
+a.opt:hover{border-color:var(--accent);background:var(--hover)}
+a.opt small{display:block;color:var(--muted);font-size:.8em;margin-top:2px}
+.oi{width:44px;height:44px;border-radius:10px;display:flex;align-items:center;justify-content:center;flex:0 0 44px}
+.oi svg{width:22px;height:22px;stroke:currentColor;fill:none;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
 </style>
 </head>
 <body>
+<div class="app APPCLS">
+SIDEBAR
+<div class="main">
+TOPBAR
 <div class="header">
 <h1>🛡️ Phobos VPN Panel</h1>
 <div class="subtitle">Obfuscated WireGuard · """ + SERVER_IP + """</div>
@@ -2044,7 +2561,137 @@ CONTENT
 <script>
 function showHelp(el){var b=el.nextElementSibling; if(b&&b.classList.contains('help-box')){b.classList.toggle('show');}}
 </script>
+</div></div>
 </body></html>"""
+
+
+_ICONS = {
+    "sessions": '<svg viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>',
+    "clients": '<svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/><path d="M3 20c0-3.3 2.7-6 6-6s6 2.7 6 6"/><path d="M16 5a3 3 0 0 1 0 6M18 14c2 .7 3 2.6 3 6"/></svg>',
+    "labels": '<svg viewBox="0 0 24 24"><path d="M3 12V4h8l9 9-8 8-9-9z"/><circle cx="7.5" cy="8.5" r="1.2"/></svg>',
+    "servers": '<svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>',
+    "settings": '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/></svg>',
+    "logout": '<svg viewBox="0 0 24 24"><path d="M9 4H5v16h4M16 8l4 4-4 4M20 12H9"/></svg>',
+}
+_SHIELD = ('<svg viewBox="0 0 24 24" style="width:20px;height:20px;stroke:var(--accent);fill:none;stroke-width:1.8;'
+           'stroke-linecap:round;stroke-linejoin:round"><path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/></svg>')
+
+
+def _sidebar_topbar():
+    """Left menu + top bar (logged-in admin only). Returns (sidebar_html, topbar_html, body_class)."""
+    if not session.get("auth"):
+        return "", "", "noside"
+    path = request.path
+    L = cur_lang()
+    items = [("sessions", "/sessions", "Сессии", "Sessions"), ("clients", "/clients", "Клиенты", "Clients"),
+             ("labels", "/labels", "Метки", "Labels"), ("servers", "/servers", "Серверы", "Servers"),
+             ("settings", "/settings", "Настройки", "Settings")]
+    cnt = {}
+    try:
+        cnt["clients"] = len(get_clients())
+        cnt["sessions"] = sum(1 for _i in get_wg_peers().values() if is_peer_online(_i.get("latest handshake", "")))
+    except Exception:
+        pass
+    active = next((k for k, h, _r, _e in items if path.startswith(h)), "")
+    if path.startswith("/client/"):
+        active = "clients"
+    ver = html_lib.escape(panel_version().replace('-beta', 'β').replace('-dev', 'δ'))
+    ui = update_info()
+    out = ['<aside class="side"><div class="logo">' + _SHIELD + 'PHOBOS<small>v' + ver + '</small></div>']
+    title = ""
+    for k, h, ru, en in items:
+        lbl = ru if L == "ru" else en
+        if k == active:
+            title = lbl
+        c = f'<span class="cnt">{cnt[k]}</span>' if k in cnt else ""
+        out.append(f'<a class="it{" on" if k == active else ""}" href="{h}">{_ICONS[k]}<span>{lbl}</span>{c}</a>')
+    if ui:  # new version: green pulsing menu item right under «Настройки», opens the update window
+        new = html_lib.escape(ui["latest"].replace('-beta', 'β').replace('-dev', 'δ'))
+        out.append(f'<a class="it upd-it" href="#" onclick="var m=document.getElementById(\'upd-modal\');if(m)m.style.display=\'flex\';return false">'
+                   f'<span>↑</span><span>{tr("Обновить до", "Update to")} {new}</span></a>'
+                   '<style>.side .upd-it{background:#16a34a;color:#fff!important;animation:updpulse 1.6s ease-in-out infinite}'
+                   '@keyframes updpulse{0%,100%{box-shadow:0 0 0 0 rgba(22,163,74,.6)}50%{box-shadow:0 0 0 6px rgba(22,163,74,0)}}</style>')
+    out.append('<div class="sp"></div>')
+    out.append(f'<a class="it" href="/logout">{_ICONS["logout"]}<span>{"Выход" if L == "ru" else "Logout"}</span></a></aside>')
+    other = "en" if L == "ru" else "ru"
+    top = (f'<div class="top"><h1>{title or "Phobos"}</h1><div class="tb">'
+           f'<a href="#" onclick="toggleTheme();return false" title="theme">◐</a>'
+           f'<a href="/lang/{other}" title="language">{other.upper()}</a></div></div>')
+    return "".join(out), top, ""
+
+
+def update_hud():
+    """Jarvis-style full-screen update overlay (settings page only). Intercepts update / rollback / check forms."""
+    return """
+<style>
+#jv{position:fixed;inset:0;z-index:200;display:none;flex-direction:column;align-items:center;justify-content:center;background:radial-gradient(ellipse at center,#04121f 0%,#02060d 70%);color:#7dd3fc;font-family:Menlo,Consolas,monospace;overflow:hidden}
+#jv.show{display:flex}
+#jv::before{content:"";position:absolute;inset:0;background:linear-gradient(rgba(34,211,238,.06) 1px,transparent 1px),linear-gradient(90deg,rgba(34,211,238,.06) 1px,transparent 1px);background-size:46px 46px;mask-image:radial-gradient(circle at center,#000 20%,transparent 75%)}
+#jv::after{content:"";position:absolute;left:0;right:0;height:140px;top:-140px;background:linear-gradient(transparent,rgba(34,211,238,.10),transparent);animation:jscan 4s linear infinite}
+@keyframes jscan{to{top:100%}}
+.jr{position:relative;width:260px;height:260px}
+.jr svg{position:absolute;inset:0;width:100%;height:100%;filter:drop-shadow(0 0 6px currentColor)}
+.jr .r1{animation:jspin 9s linear infinite;transform-origin:130px 130px}
+.jr .r2{animation:jspin 5s linear infinite reverse;transform-origin:130px 130px}
+.jr .r3{animation:jspin 14s linear infinite;transform-origin:130px 130px}
+@keyframes jspin{to{transform:rotate(360deg)}}
+.jr .c{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center}
+.jr .pct{font-size:3em;font-weight:700;color:#e0f7ff;text-shadow:0 0 14px #22d3ee}
+.jr .sub{font-size:.7em;letter-spacing:.3em;color:#38bdf8;margin-top:2px}
+#jv h2{letter-spacing:.45em;font-size:1.05em;margin:26px 0 6px;color:#67e8f9;text-shadow:0 0 10px #22d3ee;font-weight:600}
+#jstat{font-size:.85em;color:#a5f3fc;min-height:1.3em}
+#jstat::after{content:"_";animation:jblink 1s steps(2) infinite}
+@keyframes jblink{50%{opacity:0}}
+.jbar{width:min(520px,80vw);height:4px;background:rgba(34,211,238,.15);border-radius:3px;margin:18px 0 12px;overflow:hidden;box-shadow:0 0 12px rgba(34,211,238,.25)}
+.jbar i{display:block;height:100%;width:0;background:linear-gradient(90deg,#0891b2,#22d3ee,#a5f3fc);box-shadow:0 0 12px #22d3ee;transition:width .6s ease}
+#jstages{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;max-width:620px;font-size:.66em;letter-spacing:.12em;margin-bottom:12px}
+#jstages span{padding:3px 8px;border:1px solid rgba(34,211,238,.3);border-radius:3px;color:#475569}
+#jstages span.on{color:#22d3ee;border-color:#22d3ee;box-shadow:0 0 8px rgba(34,211,238,.5)}
+#jstages span.ok{color:#4ade80;border-color:rgba(74,222,128,.5)}
+#jlog{width:min(720px,88vw);height:120px;overflow:hidden;font-size:.7em;line-height:1.5;color:#38bdf8;opacity:.85;white-space:pre-wrap;border-top:1px solid rgba(34,211,238,.25);padding-top:8px;-webkit-mask-image:linear-gradient(transparent,#000 30%);mask-image:linear-gradient(transparent,#000 30%)}
+#jv.done{color:#4ade80}#jv.done .pct,#jv.done h2{color:#bbf7d0;text-shadow:0 0 14px #4ade80}#jv.done .jbar i{background:#4ade80;box-shadow:0 0 12px #4ade80}
+#jv.err{color:#f87171}#jv.err .pct,#jv.err h2{color:#fecaca;text-shadow:0 0 14px #f87171}#jv.err .jbar i{background:#f87171}
+#jclose{display:none;margin-top:14px;background:transparent;color:inherit;border:1px solid currentColor;padding:8px 22px;letter-spacing:.2em;cursor:pointer;font-family:inherit}
+#jv.err #jclose{display:block}
+</style>
+<div id="jv"><div class="jr">
+<svg viewBox="0 0 260 260" fill="none" stroke="currentColor"><circle cx="130" cy="130" r="122" stroke-width="1" opacity=".35"/>
+<g class="r1"><circle cx="130" cy="130" r="112" stroke-width="3" stroke-dasharray="90 40 20 40"/></g>
+<g class="r2"><circle cx="130" cy="130" r="96" stroke-width="2" stroke-dasharray="4 10"/></g>
+<g class="r3"><circle cx="130" cy="130" r="80" stroke-width="5" stroke-dasharray="140 60" opacity=".7"/></g>
+<circle cx="130" cy="130" r="62" stroke-width="1" opacity=".5"/></svg>
+<div class="c"><div class="pct" id="jpct">0%</div><div class="sub" id="jsub">PHOBOS</div></div></div>
+<h2 id="jtitle">P H O B O S &nbsp;//&nbsp; UPDATE</h2><div id="jstat"></div>
+<div class="jbar"><i id="jbar"></i></div><div id="jstages"></div><div id="jlog"></div>
+<button id="jclose" onclick="document.getElementById('jv').classList.remove('show')">""" + tr("ЗАКРЫТЬ","CLOSE") + """</button></div>
+<script>
+(function(){
+  var ST=[["\u0422\u0435\u043a\u0443\u0449\u0430\u044f:","""+'"'+tr("СВЕРКА ВЕРСИЙ","VERSION CHECK")+'"'+"""],["\u0411\u044d\u043a\u0430\u043f:","""+'"'+tr("СНИМОК СОСТОЯНИЯ","STATE SNAPSHOT")+'"'+"""],["[self-check]","""+'"'+tr("САМОДИАГНОСТИКА","SELF-CHECK")+'"'+"""],["TCP fallback","""+'"'+tr("РЕЗЕРВНЫЙ КАНАЛ","FALLBACK LINK")+'"'+"""],["Router packages","""+'"'+tr("ПАКЕТЫ РОУТЕРОВ","ROUTER PACKAGES")+'"'+"""]];
+  var MSG={start:"""+'"'+tr("ИНИЦИАЛИЗАЦИЯ ПРОТОКОЛА ОБНОВЛЕНИЯ","INITIALISING UPDATE PROTOCOL")+'"'+""",run:"""+'"'+tr("ИДЁТ ОБНОВЛЕНИЕ СИСТЕМЫ","SYSTEM UPDATE IN PROGRESS")+'"'+""",restart:"""+'"'+tr("ПЕРЕЗАПУСК ЯДРА ПАНЕЛИ","RESTARTING PANEL CORE")+'"'+""",ok:"""+'"'+tr("ОПЕРАЦИЯ ЗАВЕРШЕНА","OPERATION COMPLETE")+'"'+""",err:"""+'"'+tr("СБОЙ ОПЕРАЦИИ","OPERATION FAILED")+'"'+"""};
+  var $=function(i){return document.getElementById(i)},fake=0,tm=null,t0=0,sawFail=false;
+  function stages(log){var h='',k=0;ST.forEach(function(s,i){var on=log.indexOf(s[0])>=0;if(on)k=i+1;h+='<span class="'+(on?'ok':'')+'">'+s[1]+'</span>'});$('jstages').innerHTML=h;return k}
+  function show(pct,stat){$('jpct').textContent=Math.round(pct)+'%';$('jbar').style.width=pct+'%';$('jstat').textContent=stat}
+  function poll(){fetch('/api/update/status',{credentials:'same-origin'}).then(function(r){if(r.status===401||r.redirected)throw 0;return r.json()}).then(function(j){
+      var k=stages(j.log);$('jlog').textContent=j.log;$('jlog').scrollTop=1e9;
+      if(sawFail){sawFail=false}
+      if(j.rc!==null&&j.rc!==undefined){clearInterval(tm);
+        if(j.rc===0){$('jv').classList.add('done');show(100,MSG.ok+' \u2014 v'+j.version);$('jsub').textContent='v'+j.version;setTimeout(function(){location.reload()},3500)}
+        else{$('jv').classList.add('err');show(Math.max(fake,10),MSG.err+' (code '+j.rc+')');$('jtitle').innerHTML='ERROR'}
+        return}
+      fake=Math.min(94,Math.max(fake,6+k*16)+0.6);show(fake,k?ST[k-1][1]+'...':MSG.run)
+    }).catch(function(){sawFail=true;fake=Math.min(96,fake+0.4);show(fake,MSG.restart+'...')})}
+  window.phobosUpdate=function(arg,title){
+    var v=$('jv');v.className='show';$('jlog').textContent='';$('jtitle').innerHTML=title||'P H O B O S &nbsp;//&nbsp; UPDATE';fake=0;show(2,MSG.start);$('jstages').innerHTML='';$('jsub').textContent='PHOBOS';
+    fetch('/api/update/start',{method:'POST',credentials:'same-origin',body:new URLSearchParams({arg:arg})}).then(function(r){return r.json()}).then(function(j){
+      if(!j.ok){v.classList.add('err');show(0,MSG.err+': '+j.msg);return}
+      clearInterval(tm);tm=setInterval(poll,1000)}).catch(function(e){v.classList.add('err');show(0,MSG.err)})};
+  document.querySelectorAll('form').forEach(function(f){var a=f.querySelector('input[name=action]');if(!a)return;var v=a.value;
+    if(v!=='update'&&v!=='rollback'&&v!=='check')return;
+    f.addEventListener('submit',function(e){e.preventDefault();var tg=f.querySelector('[name=target]');var arg=v==='rollback'?'--rollback':v==='check'?'--check':((tg&&tg.value.trim())||'main');
+      window.phobosUpdate(arg,v==='rollback'?'R O L L B A C K':v==='check'?'S C A N':null)})});
+})();
+</script>
+"""
 
 
 # ── «Доступна новая версия»: проверка канала раз в час + баннер с описанием ──
@@ -2181,7 +2828,11 @@ def update_banner():
 
 
 def render(content):
-    return PAGE.replace("CONTENT", update_banner() + content)
+    content = update_banner() + content
+    side, top, cls = _sidebar_topbar()
+    if request.path == "/settings" and session.get("auth"):
+        content = content + update_hud()
+    return PAGE.replace("APPCLS", cls).replace("SIDEBAR", side).replace("TOPBAR", top).replace("CONTENT", content)
 
 
 @app.errorhandler(404)
@@ -2537,77 +3188,34 @@ def dashboard():
     return redirect(url_for("sessions_page"))
 
 
-@app.route("/sessions")
+@app.route("/api/update/start", methods=["POST"])
 @auth_required
-def sessions_page():
-    s = load_settings()
-    labels = s.get("labels", {})
-    sessions = get_active_sessions()
-    # Online = fresh handshake on ANY server (router may be on a backup)
-    online_all = set()
-    for _pub, _info in get_wg_peers().items():
-        if is_peer_online(_info.get("latest handshake", "")):
-            online_all.add(_pub)
-    for _ip, _hs in server_handshakes_cache.items():
-        for _pub, _ts in _hs.items():
-            if _ts and (time.time() - _ts) < 180:
-                online_all.add(_pub)
-
-    rows = ""
-    online_count = 0
-    for sess in sessions:
-        online = sess["public_key"] in online_all
-        if online:
-            online_count += 1
-        status = '<span class="badge badge-on">Online</span>' if online else '<span class="badge badge-off">Offline</span>'
-        real_ip = sess["real_ip"]
-        label = labels.get(sess.get("tunnel_ip", ""), "") or labels.get(real_ip, "")
-        disp = client_display_name(sess["client_id"], s)
-        disp_html = html_lib.escape(disp)
-        client_cell = disp_html if disp == sess["client_id"] else f'{disp_html}<div style="font-size:.78em;color:var(--muted)">{sess["client_id"]}</div>'
-
-        rows += f"""<tr>
-        <td>{client_cell}</td>
-        <td>{sess['tunnel_ip']}</td>
-        <td>{real_ip}</td>
-        <td>{('<b>' + label + '</b>') if label else '—'}</td>
-        <td>{sess['handshake']}</td>
-        <td>{sess['rx']} / {sess['tx']}</td>
-        <td>{status}</td>
-        <td style="display:flex;gap:4px;align-items:center"><a href="/kick/{sess['public_key']}" class="btn btn-danger btn-sm">{tr("Отключить","Kick")}</a>{hlp("Принудительно разорвать текущую сессию клиента (сбросить WG-пир). Клиент переподключится автоматически.","Force-drop the client current session (reset the WG peer). The client reconnects automatically.")}</td>
-        </tr>"""
-
-    if not rows:
-        rows = '<tr><td colspan="8" style="text-align:center;color:var(--muted)">{tr("Нет активных сессий","No active sessions")}</td></tr>'
-
-    html = f"""
-    <div class="container">
-    {nav('sessions', online_count)}
-    <div class="card">
-    <h2>{tr("Активные сессии","Active sessions")}</h2>
-    <table>
-    <tr><th>Клиент</th><th>VPN IP</th><th>Real IP</th><th>Метка</th><th>Handshake</th><th>RX / TX</th><th>Статус</th><th></th></tr>
-    {rows}
-    </table>
-    </div>
-    </div>"""
-    return render(html)
+def api_update_start():
+    arg = (request.form.get("arg") or "").strip()
+    if arg in ("", "stable", "latest"):
+        arg = "main" if arg != "" else arg
+    ok, m = start_update_job(arg)
+    return jsonify({"ok": ok, "msg": m}), (200 if ok else 400)
 
 
-@app.route("/kick/<path:pub_key>")
+@app.route("/api/update/status")
 @auth_required
-def kick(pub_key):
-    kick_peer(pub_key)
-    return redirect(url_for("sessions_page"))
+def api_update_status():
+    return jsonify(update_job_status())
 
 
-def _html_attr(value):
-    return html_lib.escape(str(value or ""), quote=True)
+@app.route("/api/sysstats")
+@auth_required
+def api_sysstats():
+    return jsonify({"hist": list(STATS_HIST), "info": sys_info()})
 
 
-def _terminal_button(url, title):
-    return (f'<a href="{_html_attr(url)}" class="btn btn-sm" '
-            f'style="background:#334155" title="{_html_attr(title)}">🖥️</a>')
+def _to_bytes(txt):
+    m = re.match(r"([\d.]+)\s*([KMGT]?i?B)", (txt or "").strip())
+    if not m:
+        return 0
+    mult = {"B": 1, "KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30, "TiB": 1 << 40}
+    return float(m.group(1)) * mult.get(m.group(2), 1)
 
 
 def _fmt_bytes(n):
@@ -2631,10 +3239,147 @@ def api_traffic():
     return jsonify({"month": d.get("month"), "usage": d.get("usage", {}), "history": d.get("history", {})})
 
 
+SESS_COLORS = ["#8b8cf7", "#22d3ee", "#f472b6", "#facc15", "#34d399", "#fb923c", "#a78bfa", "#60a5fa"]
+
+
+@app.route("/sessions")
+@auth_required
+def sessions_page():
+    s = load_settings()
+    labels = s.get("labels", {})
+    sessions = get_active_sessions()
+    # Online = fresh handshake on ANY server (router may be on a backup)
+    online_all = set()
+    for _pub, _info in get_wg_peers().items():
+        if is_peer_online(_info.get("latest handshake", "")):
+            online_all.add(_pub)
+    for _ip, _hs in server_handshakes_cache.items():
+        for _pub, _ts in _hs.items():
+            if _ts and (time.time() - _ts) < 180:
+                online_all.add(_pub)
+
+    rows = ""
+    online_count = 0
+    seg = []
+    for n, sess in enumerate(sessions):
+        online = sess["public_key"] in online_all
+        if online:
+            online_count += 1
+        color = SESS_COLORS[n % len(SESS_COLORS)]
+        status = f'<span class="badge badge-on">{tr("Онлайн","Online")}</span>' if online else f'<span class="badge badge-off">{tr("Оффлайн","Offline")}</span>'
+        real_ip = sess["real_ip"]
+        label = labels.get(sess.get("tunnel_ip", ""), "") or labels.get(real_ip, "")
+        disp = client_display_name(sess["client_id"], s)
+        disp_html = html_lib.escape(disp)
+        sub = f'<div style="font-size:.78em;color:var(--muted);margin-left:18px">{sess["client_id"]}</div>' if disp != sess["client_id"] else ""
+        client_cell = f'<span class="dot" style="background:{color}"></span><b>{disp_html}</b>{sub}'
+        seg.append((color, _to_bytes(sess["rx"]) + _to_bytes(sess["tx"])))
+        rows += f"""<tr>
+        <td>{client_cell}</td>
+        <td style="font-family:Menlo,monospace">{sess['tunnel_ip']}</td>
+        <td>{real_ip}</td>
+        <td>{('<b>' + html_lib.escape(label) + '</b>') if label else '—'}</td>
+        <td style="font-family:Menlo,monospace;font-size:.82em">{sess['handshake']}</td>
+        <td style="font-family:Menlo,monospace;font-size:.82em">{sess['rx']} ↓ / {sess['tx']} ↑</td>
+        <td>{status}</td>
+        <td style="display:flex;gap:4px;align-items:center"><a href="/kick/{sess['public_key']}" class="btn btn-danger btn-sm">{tr("Отключить","Kick")}</a>{hlp("Принудительно разрывает сессию клиента. Клиент переподключится сам через пару секунд, если не заблокирован.","Forcibly drops the client session. The client reconnects by itself in a few seconds unless locked.")}</td>
+        </tr>"""
+
+    if not rows:
+        rows = f'<tr><td colspan="8" style="text-align:center;color:var(--muted)">{tr("Нет активных сессий","No active sessions")}</td></tr>'
+
+    total = sum(v for _c, v in seg)
+    R, C = 70, 2 * 3.14159265 * 70
+    circles, off = "", 0.0
+    for color, v in seg:
+        ln = C * (v / total) if total else 0
+        if ln > 0:
+            circles += f'<circle cx="95" cy="95" r="{R}" fill="none" stroke="{color}" stroke-width="16" stroke-dasharray="{ln:.2f} {C - ln:.2f}" stroke-dashoffset="{-off:.2f}"/>'
+        off += ln
+    donut = (f'<div class="donut"><svg viewBox="0 0 190 190"><circle cx="95" cy="95" r="{R}" fill="none" stroke="var(--border)" stroke-width="16"/>{circles}</svg>'
+             f'<div class="c"><b>{_fmt_bytes(total)}</b><span>{tr("общий трафик","total traffic")}</span></div></div>')
+
+    stat = lambda i, name, icon: f"""<div class="stat"><div class="k">{icon} {name}</div><div class="v" id="v-{i}">–</div><div class="s" id="s-{i}">&nbsp;</div>
+      <svg id="g-{i}" viewBox="0 0 200 46" preserveAspectRatio="none"></svg><div class="m"><span id="a-{i}"></span><span id="p-{i}"></span></div></div>"""
+    dash = f"""
+    <div class="card"><h2 style="display:flex;justify-content:space-between"><span>{tr("Сессии","Sessions")}</span><span>{len(sessions)} · {tr("онлайн","online")}: {online_count}</span></h2>
+    <div class="sess-wrap">{donut}<div class="tbl"><table>
+    <tr><th>{tr("Клиент","Client")}</th><th>VPN IP</th><th>Real IP</th><th>{tr("Метка","Label")}</th><th>{tr("Рукопожатие","Handshake")}</th><th>RX / TX</th><th>{tr("Статус","Status")}</th><th></th></tr>
+    {rows}
+    </table></div></div></div>
+    <div class="grid4">{stat("cpu","CPU","▣")}{stat("ram","RAM","▤")}{stat("swap","SWAP","⇄")}{stat("disk",tr("ХРАНИЛИЩЕ","STORAGE"),"◫")}</div>
+    <div class="card"><div style="display:flex;justify-content:space-between;align-items:flex-start"><div><h2 style="margin-bottom:2px">{tr("Общая скорость","Total speed")}</h2><div style="font-size:.74em;color:var(--muted)" id="peak"></div></div>
+    <div style="font-size:.85em;font-weight:700;text-align:right" id="now"></div></div>
+    <svg id="chart" class="chart" viewBox="0 0 1000 260" preserveAspectRatio="none"></svg>
+    <div class="legend"><label id="lg-rx"><i style="border-color:#3b82f6;background:#3b82f633"></i>{tr("Приём","RX")}</label><label id="lg-tx"><i style="border-color:#9ca3af;background:#9ca3af33"></i>{tr("Отдача","TX")}</label></div>
+    <div class="sumrow"><div><span>{tr("Отправлено","Sent")}</span><b id="t-tx">–</b></div><div><span>{tr("Получено","Received")}</span><b id="t-rx">–</b></div><div><span>{tr("Среднее","Average")}</span><b id="t-avg">–</b></div></div></div>
+    <div class="card"><div class="info4">
+      <div><div class="k">⏱ {tr("Аптайм","Uptime")}</div><div class="two"><div><div class="sm">{tr("ПАНЕЛЬ","PANEL")}</div><div class="big" id="i-pu">–</div></div><div><div class="sm">{tr("ОС","OS")}</div><div class="big" id="i-ou">–</div></div></div></div>
+      <div><div class="k">▤ {tr("Процесс панели","Panel process")}</div><div class="two"><div><div class="sm">RAM</div><div class="big" id="i-pr">–</div></div><div><div class="sm">{tr("ПОТОКИ","THREADS")}</div><div class="big" id="i-th">–</div></div></div></div>
+      <div><div class="k">▤ {tr("Обфускатор","Obfuscator")}</div><div class="big" id="i-or">–</div><div class="sm" id="i-on">&nbsp;</div></div>
+      <div><div class="k">◎ {tr("IP-адреса","IP addresses")}</div><div class="big" style="font-size:1.1em" id="i-ip">–</div><div class="sm" id="i-wg"></div></div>
+    </div></div>
+    <script>
+    (function(){{
+      var hid={{rx:false,tx:false}};
+      function fb(n){{var u=['B','KB','MB','GB','TB'],i=0;while(n>=1024&&i<4){{n/=1024;i++}}return (i?n.toFixed(1):Math.round(n))+' '+u[i]}}
+      function fs(n){{return fb(n)+'/s'}}
+      function fd(s){{var d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);return d?d+'d '+h+'h':(h?h+'h '+m+'m':m+'m')}}
+      function path(a,mx,w,h,sm){{if(!a.length)return '';var st=w/Math.max(a.length-1,1),p=a.map(function(v,i){{return [i*st,h-(v/mx)*(h-4)-2]}});
+        var d='M'+p[0][0]+','+p[0][1];for(var i=1;i<p.length;i++){{var x=(p[i-1][0]+p[i][0])/2;d+=' C'+x+','+p[i-1][1]+' '+x+','+p[i][1]+' '+p[i][0]+','+p[i][1]}}return d}}
+      function spark(id,arr,mx,pct){{var el=document.getElementById('g-'+id);if(!arr.length)return;var d=path(arr,mx,200,46);
+        el.innerHTML='<path d="'+d+' L200,46 L0,46 Z" fill="var(--accent)" fill-opacity=".12"/><path d="'+d+'" fill="none" stroke="var(--accent)" stroke-width="1.6" vector-effect="non-scaling-stroke"/>';
+        var avg=arr.reduce(function(a,b){{return a+b}},0)/arr.length,pk=Math.max.apply(null,arr);
+        document.getElementById('a-'+id).textContent='{tr("СРЕД","AVG")} '+(pct?avg.toFixed(1)+'%':'');document.getElementById('p-'+id).textContent='{tr("ПИК","PEAK")} '+(pct?pk.toFixed(1)+'%':'')}}
+      function draw(j){{var H=j.hist,I=j.info;if(!H.length)return;var L=H[H.length-1];
+        var cpu=H.map(function(x){{return x.cpu}}),ram=H.map(function(x){{return x.ram_t?100*x.ram/x.ram_t:0}}),sw=H.map(function(x){{return x.swap_t?100*x.swap/x.swap_t:0}}),dk=H.map(function(x){{return x.disk_t?100*x.disk/x.disk_t:0}});
+        function put(id,arr,main,sub,unit){{document.getElementById('v-'+id).innerHTML=arr[arr.length-1].toFixed(1)+' <small>%</small>';document.getElementById('s-'+id).textContent=sub;spark(id,arr,100,true)}}
+        put('cpu',cpu,0,I.cores+' {tr("ядро/ядер","cores")}');put('ram',ram,0,fb(L.ram).replace(' ',' ')+' / '+fb(L.ram_t));put('swap',sw,0,fb(L.swap)+' / '+fb(L.swap_t));put('disk',dk,0,fb(L.disk_t-L.disk)+' {tr("свободно","free")} / '+fb(L.disk_t));
+        var rx=H.map(function(x){{return x.rx}}),tx=H.map(function(x){{return x.tx}}),mx=Math.max.apply(null,rx.concat(tx).concat([1024]));
+        var svg='';[0,1,2,3].forEach(function(i){{var y=10+i*60;svg+='<line x1="0" x2="1000" y1="'+y+'" y2="'+y+'" stroke="var(--border)" stroke-dasharray="3 5" vector-effect="non-scaling-stroke"/>'}});
+        [['rx','#3b82f6',rx],['tx','#9ca3af',tx]].forEach(function(s){{if(hid[s[0]])return;var d=path(s[2],mx,1000,250);svg+='<path d="'+d+' L1000,250 L0,250 Z" fill="'+s[1]+'" fill-opacity=".14"/><path d="'+d+'" fill="none" stroke="'+s[1]+'" stroke-width="2" vector-effect="non-scaling-stroke"/>'}});
+        document.getElementById('chart').innerHTML=svg;
+        document.getElementById('peak').textContent='{tr("пик","peak")} ↓ '+fs(Math.max.apply(null,rx))+' / ↑ '+fs(Math.max.apply(null,tx));
+        document.getElementById('now').innerHTML='↑ '+fs(L.tx)+' &nbsp; ↓ '+fs(L.rx);
+        document.getElementById('t-tx').textContent=fb(I.wg_tx);document.getElementById('t-rx').textContent=fb(I.wg_rx);
+        var ar=rx.reduce(function(a,b){{return a+b}},0)/rx.length,at=tx.reduce(function(a,b){{return a+b}},0)/tx.length;document.getElementById('t-avg').textContent='↑ '+fs(at)+' ↓ '+fs(ar);
+        document.getElementById('i-pu').textContent=fd(I.panel_up);document.getElementById('i-ou').textContent=fd(I.os_up);document.getElementById('i-pr').textContent=fb(I.panel_rss);document.getElementById('i-th').textContent=I.threads;
+        document.getElementById('i-or').textContent=fb(I.obf_rss);document.getElementById('i-on').textContent='wg-obfuscator × '+I.obf_n;document.getElementById('i-ip').textContent=I.ip;document.getElementById('i-wg').textContent=I.wg_addr+' (wg0)'}}
+      function tick(){{fetch('/api/sysstats').then(function(r){{return r.json()}}).then(draw).catch(function(){{}})}}
+      ['rx','tx'].forEach(function(k){{document.getElementById('lg-'+k).onclick=function(){{hid[k]=!hid[k];this.classList.toggle('off',hid[k]);tick()}}}});
+      tick();setInterval(tick,2500);
+    }})();
+    </script>"""
+    html = f"""
+    <div class="container">
+    {dash}
+    </div>"""
+    return render(html)
+
+
+@app.route("/kick/<path:pub_key>")
+@auth_required
+def kick(pub_key):
+    kick_peer(pub_key)
+    return redirect(url_for("sessions_page"))
+
+
+def _html_attr(value):
+    return html_lib.escape(str(value or ""), quote=True)
+
+
+def _terminal_button(url, title):
+    return (f'<a href="{_html_attr(url)}" class="btn btn-sm" '
+            f'style="background:#334155" title="{_html_attr(title)}">🖥️</a>')
+
+
 @app.route("/clients", methods=["GET", "POST"])
 @auth_required
 def clients_page():
     s = load_settings()
+    # iPhone / macOS tabs only in beta/dev (stable has no Apple apps)
+    apple_tabs = ("<a data-t=\"ios\" onclick=\"loadConn('{cid}','ios')\">iOS</a>"
+                  "<a data-t=\"macos\" onclick=\"loadConn('{cid}','macos')\">macOS</a>") if apple_apps() else ""
     subs = s.get("subscriptions", {})
     msg = ""
 
@@ -2718,6 +3463,37 @@ def clients_page():
                 ok, rep = apply_speed_limits()
                 msg = f'<div class="alert {"alert-ok" if ok else "alert-error"}">{html_lib.escape(rep)}</div>'
 
+        elif action == "set_fw":
+            client_id = request.form.get("client_id", "").strip()
+            text = request.form.get("fw_list", "").strip()
+            try:
+                parse_fw_list(text)
+                fwd = s.setdefault("client_fw", {})
+                if text:
+                    fwd[client_id] = text
+                else:
+                    fwd.pop(client_id, None)
+                save_settings(s)
+                apply_client_fw()
+                msg = f'<div class="alert alert-ok">{tr("Firewall для","Firewall for")} {html_lib.escape(client_id)}: {tr("разрешено только","allowed only")} {html_lib.escape(text) if text else tr("— ограничений нет","— no restrictions")}</div>'
+            except ValueError as e:
+                msg = f'<div class="alert alert-error">{tr("Неверная запись","Bad entry")}: {html_lib.escape(str(e))}</div>'
+
+        elif action == "set_preset":
+            client_id = request.form.get("client_id", "").strip()
+            pid = request.form.get("preset_id", "").strip()
+            cp = s.setdefault("client_presets", {})
+            if client_id and pid and any(p["id"] == pid for p in s.get("obf_presets", [])):
+                cp[client_id] = pid
+            elif client_id:
+                cp.pop(client_id, None)
+            save_settings(s)
+            try:
+                fanout_router_config(client_id)
+            except Exception:
+                pass
+            msg = f'<div class="alert alert-ok">{tr("Пресет для","Preset for")} {html_lib.escape(client_id)}: {tr("сохранён; телефону — заново импортировать ссылку","saved; phones must re-import the link")}</div>'
+
         elif action == "set_expiry":
             client_id = request.form.get("client_id", "").strip()
             expiry = request.form.get("expiry", "").strip()
@@ -2773,6 +3549,19 @@ def clients_page():
                 else:
                     msg = f'<div class="alert alert-ok">{client_id} → {server_ip} ✓ (saved — router applies within ~15s)</div>'
 
+        elif action == "set_pinned":
+            client_id = request.form.get("client_id", "").strip()
+            if client_id:
+                pn = s.get("client_pinned", {})
+                if request.form.get("pinned") == "1":
+                    pn[client_id] = True
+                else:
+                    pn.pop(client_id, None)
+                s["client_pinned"] = pn
+                save_settings(s)
+                fanout_router_config(client_id)
+                msg = f'<div class="alert alert-ok">{client_id}: {tr("сохранено — роутер применит за ~15с", "saved — router applies within ~15s")}</div>'
+
     clients = get_clients(include_orphans=True)
     peers = get_wg_peers()
     online_pubs = set()
@@ -2798,7 +3587,9 @@ def clients_page():
 
     limits = s.get("speed_limits", {})
     rows = ""
+    modals = ""
     today = datetime.now().date()
+    _tusage = _traffic_load().get("usage", {})
     for c in clients:
         cid = c.get("client_id", "")
         disp = str(aliases.get(cid, "") or "").strip() or cid
@@ -2833,6 +3624,7 @@ def clients_page():
                 pass
 
         assigned_ip = assignments.get(cid, SERVER_IP)
+        pin_v = "1" if s.get("client_pinned", {}).get(cid) else "0"
         srv_opts = ""
         for sv in all_srv:
             sel = " selected" if sv["ip"] == assigned_ip else ""
@@ -2878,6 +3670,28 @@ def clients_page():
             {h_set}
             </form>
         """
+        if s.get("obf_presets"):
+            _cur = s.get("client_presets", {}).get(cid, "")
+            _opts = f'<option value="">{tr("основной","default")}</option>' + "".join(
+                f'<option value="{p["id"]}"{" selected" if p["id"] == _cur else ""}>{html_lib.escape(p["name"])}</option>' for p in s["obf_presets"])
+            server_cell += f"""
+            <form method="post" style="margin-top:4px">
+            <input type="hidden" name="action" value="set_preset">
+            <input type="hidden" name="client_id" value="{cid}">
+            <select name="preset_id" title="{tr("Пресет обфускатора","Obfuscator preset")}">{_opts}</select>
+            <button class="btn btn-primary btn-sm" type="submit">{set_lbl}</button>
+            </form>
+            """
+        _fwv = s.get("client_fw", {}).get(cid, "")
+        server_cell += f"""
+            <details style="margin-top:4px"><summary style="cursor:pointer;color:{'var(--warn)' if _fwv else 'var(--muted)'}">🛡 Firewall{' ●' if _fwv else ''}</summary>
+            <form method="post">
+            <input type="hidden" name="action" value="set_fw">
+            <input type="hidden" name="client_id" value="{cid}">
+            <textarea name="fw_list" rows="2" placeholder="1.1.1.1, 8.8.8.8:53/udp, 10.0.0.0/8" title="{_html_attr(tr("Разрешённые адреса (через запятую): ip, сеть, ip:порт, ip:порт/udp. Пусто — без ограничений. Всё остальное от клиента блокируется (DNS 1.1.1.1/8.8.8.8 тоже — добавьте при нужде). Только IPv4.", "Allowed destinations (comma-separated): ip, net, ip:port, ip:port/udp. Empty = unrestricted. Everything else from the client is dropped (incl. DNS 1.1.1.1/8.8.8.8 — add if needed). IPv4 only."))}" style="width:190px;background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:6px;padding:4px">{html_lib.escape(_fwv)}</textarea>
+            <button class="btn btn-primary btn-sm" type="submit">{set_lbl}</button>
+            </form></details>
+            """
         expiry_cell = f"""
             <form method="post">
             <input type="hidden" name="action" value="set_expiry">
@@ -2938,7 +3752,6 @@ def clients_page():
             <button class="btn btn-sm" style="background:#475569" type="submit">{tr("Имя","Name")}</button>
             </form>
         """
-        _tusage = _traffic_load().get("usage", {}) if "_tusage" not in dir() else _tusage
         lim = str(limits.get(cid, "") or "")
         rate = client_rates.get(pub)
         speed = (f'<span class="cspeed" title="{tr("Скорость сейчас","Current speed")}">↓{rate[0]:.1f} ↑{rate[1]:.1f} {tr("Мбит/с","Mbit/s")}</span>' if rate else "")
@@ -2950,30 +3763,124 @@ def clients_page():
             <span class="cunit">{tr("Мбит/с","Mbit/s")}</span>
             <button class="btn btn-primary btn-sm" type="submit">{set_lbl}</button>
             </form>"""
-        rows += f"""<div class="ccard">
-        <div class="ctop"><span class="cname">{client_cell}</span> <span class="cip">{ip}</span> {status} {expiry_badge} <span class="cspeed" title="{tr('Трафик за месяц (суммарно по всем серверам)','Traffic this month (all servers)')}">{_traffic_cell(_tusage.get(cid))}</span> {f'<span class="badge badge-lock">≤{_html_attr(lim)} Mbit</span>' if lim and lim != "0" else ""} {speed}</div>
-        <div class="cctl">{server_cell}{expiry_cell}{limit_cell}{rename_box}</div>
-        <div class="cact">{actions_cell}</div>
-        </div>"""
+        if is_orphan:
+            rows += f"""<tr class="crow"><td><b>{html_lib.escape(disp)}</b><div class="cip">{ip}</div></td><td>{status}</td>
+            <td colspan="5" style="color:var(--warn);font-size:.85em">{tr("Сиротский peer в wg0 (нет папки клиента)", "Orphan peer in wg0 (no client folder)")}</td>
+            <td><div class="acts">{actions_cell}</div></td></tr>"""
+            continue
+        primary = next((sv for sv in all_srv if sv["ip"] == assigned_ip), {}).get("is_primary")
+        star = ' <span style="color:var(--accent)" title="Primary">★</span>' if primary else ""
+        name_html = f'<b>{html_lib.escape(disp)}</b>' + (f' <span class="cip">({cid})</span>' if disp != cid else "")
+        sw = lambda on, action, extra="": (f'<form method="post" style="margin:0"><input type="hidden" name="action" value="{action}">'
+                                           f'<input type="hidden" name="client_id" value="{cid}">{extra}'
+                                           f'<button class="sw{" on" if on else ""}" type="submit" title="{_html_attr(notify_ttl if action == "toggle_notify" else warp_btn_title)}"></button></form>')
+        notify_sw = sw(_notify, "toggle_notify")
+        warp_sw = sw(warp_on, "toggle_warp_client", f'<input type="hidden" name="desired" value="{"off" if warp_on else "on"}">')
+        exp_cell = (html_lib.escape(expiry) + " " + expiry_badge) if expiry else "∞"
+        lim_cell = (html_lib.escape(lim) + " Mbit/s") if lim and lim != "0" else "∞"
+        ic = lambda d: f'<svg viewBox="0 0 24 24">{d}</svg>'
+        i_qr = ic('<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3zM20 14v.01M14 20h3M20 17v4"/>')
+        i_ed = ic('<path d="M4 20h4L19 9l-4-4L4 16z"/><path d="M13.5 6.5l4 4"/>')
+        i_term = ic('<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 10l3 2-3 2M12 15h5"/>')
+        i_del = ic('<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/>')
+        cur_preset = s.get("client_presets", {}).get(cid, "")
+        preset_row = ""
+        if s.get("obf_presets"):
+            _popts = f'<option value="">{tr("основной","default")}</option>' + "".join(
+                f'<option value="{pp["id"]}"{" selected" if pp["id"] == cur_preset else ""}>{html_lib.escape(pp["name"])}</option>' for pp in s["obf_presets"])
+            preset_row = f'<label>{tr("Пресет обфускатора","Obfuscator preset")}<select name="preset_id" data-o="{cur_preset}">{_popts}</select></label>'
+        fwv = s.get("client_fw", {}).get(cid, "")
+        rows += f"""<tr class="crow" data-q="{_html_attr((disp + " " + cid + " " + ip).lower())}">
+        <td>{name_html}<div class="cip">{ip}</div></td>
+        <td>{status}</td>
+        <td class="srv">{assigned_ip}{star}</td>
+        <td>{exp_cell}</td>
+        <td>{lim_cell}</td>
+        <td style="white-space:nowrap;font-size:.85em">{_traffic_cell(_tusage.get(cid))}</td>
+        <td>{notify_sw}</td>
+        <td>{warp_sw}</td>
+        <td><div class="acts">
+          <button class="ib" onclick="openM('mc-{cid}');loadConn('{cid}','android')" title="{tr("Подключение","Connection")}">{i_qr}</button>
+          <button class="ib" onclick="openM('me-{cid}')" title="{tr("Изменить","Edit")}">{i_ed}</button>
+          <button class="ib" onclick="openM('mr-{cid}')" title="{tr("Управление роутером","Router control")}">{i_term}</button>
+          <form method="post" style="margin:0" onsubmit="return confirm('{del_confirm}')"><input type="hidden" name="action" value="delete"><input type="hidden" name="client_id" value="{cid}"><button class="ib danger" type="submit" title="{tr("Удалить","Delete")}">{i_del}</button></form>
+        </div></td></tr>"""
+        modals += f"""
+        <div class="modal" id="me-{cid}"><div class="mbox">
+          <div class="mh"><h3>{tr("Редактировать","Edit")}: {cid}</h3><button class="x" onclick="closeM('me-{cid}')">×</button></div>
+          <form id="f-{cid}" class="mb" onsubmit="return saveEdit('{cid}',this)">
+            <label>{tr("Имя в панели","Display name")}<input name="display_name" value="{_html_attr(aliases.get(cid, ''))}" data-o="{_html_attr(aliases.get(cid, ''))}" placeholder="{_html_attr(cid)}"></label>
+            <label>{tr("Сервер","Server")}<select name="server_ip" data-o="{assigned_ip}">{srv_opts}</select></label>
+            <label>{tr("Переход на другие серверы","Failover to other servers")} {hlp("«Только этот сервер» — учётка всегда выходит через выбранный сервер, без перехода. Так на одном роутере заводят несколько учёток = несколько стран выхода и раскладывают устройства политиками Keenetic. Смену сервера подхватывают только наши приложения (роутер, iOS, Android, Windows 1.4.5+); в сторонних клиентах (PhobosWG и др.) нужно заново импортировать ссылку.", "“This server only” — the account always exits via the chosen server, no failover. Use it for several accounts on one router = several exit countries, split devices with Keenetic policies. Server changes are followed only by our own apps (router, iOS, Android, Windows 1.4.5+); third-party clients (PhobosWG etc.) need the link re-imported.")}<select name="pinned" data-o="{pin_v}"><option value="0"{"" if pin_v == "1" else " selected"}>{tr("Да, при блокировке","Yes, when blocked")}</option><option value="1"{" selected" if pin_v == "1" else ""}>{tr("Только этот сервер","This server only")}</option></select></label>
+            <div class="two"><label>{tr("Срок","Expiry")}<input type="date" name="expiry" value="{expiry}" data-o="{expiry}"></label>
+            <label>{tr("Скорость (Mbit/s)","Speed (Mbit/s)")}<input type="number" name="limit_mbit" min="0" max="10000" value="{_html_attr(lim)}" data-o="{_html_attr(lim)}" placeholder="∞"></label></div>
+            {preset_row}
+            <label>🛡 Firewall <span style="color:var(--muted);font-weight:400">({tr("разрешённые адреса; пусто — без ограничений","allowed destinations; empty = unrestricted")})</span>
+              <textarea name="fw_list" rows="2" data-o="{_html_attr(fwv)}" placeholder="1.1.1.1, 8.8.8.8:53/udp, 10.0.0.0/8">{html_lib.escape(fwv)}</textarea></label>
+            <div class="merr" id="err-{cid}"></div>
+            <div class="mf"><button type="button" class="btn" style="background:var(--hover);color:var(--text);border:1px solid var(--border)" onclick="closeM('me-{cid}')">{tr("Отмена","Cancel")}</button>
+            <button class="btn btn-primary" type="submit">{tr("Сохранить","Save")}</button></div>
+          </form></div></div>
+        <div class="modal" id="mc-{cid}"><div class="mbox wide">
+          <div class="mh"><h3>{tr("Подключение","Connection")}: {cid}</h3><button class="x" onclick="closeM('mc-{cid}')">×</button></div>
+          <div class="tabs"><a class="on" data-t="android" onclick="loadConn('{cid}','android')">Android</a>{apple_tabs.replace('{cid}', cid)}<a data-t="windows" onclick="loadConn('{cid}','windows')">Windows</a><a data-t="router" onclick="loadConn('{cid}','router')">Router</a><a data-t="hr" onclick="loadConn('{cid}','hr')">HR</a></div>
+          <div class="mb conn" id="cb-{cid}"></div></div></div>
+        <div class="modal" id="mr-{cid}"><div class="mbox">
+          <div class="mh"><h3>{tr("Управление роутером","Router control")}: {cid}</h3><button class="x" onclick="closeM('mr-{cid}')">×</button></div>
+          <div class="mb">
+            <a class="opt" href="/terminal/router/{cid}"><span class="oi" style="background:#1e293b;color:#fff">{i_term}</span><span><b>SSH Terminal</b><small>{tr("Прямое подключение к роутеру","Direct router connection")}</small></span></a>
+            <a class="opt" href="/rci/router/{cid}"><span class="oi" style="background:#ede9fe;color:#7c3aed">{ic('<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M4.9 4.9l2.1 2.1M17 17l2.1 2.1M4.9 19.1L7 17M17 7l2.1-2.1"/>')}</span><span><b>RCI Console</b><small>{tr("Keenetic (KeenDNS, за NAT)","Keenetic (KeenDNS, behind NAT)")}</small></span></a>
+            <a class="opt" href="/console/router/{cid}"><span class="oi" style="background:#cffafe;color:#0891b2">{ic('<rect x="3" y="4" width="18" height="12" rx="2"/><path d="M8 20h8M12 16v4"/>')}</span><span><b>TTYD Terminal</b><small>{tr("Shell в браузере (через туннель)","Shell in the browser (via tunnel)")}</small></span></a>
+          </div></div></div>"""
     if not rows:
-        rows = f'<p style="text-align:center;color:var(--muted)">{tr("Пока нет клиентов. Создай первого клиента выше.","No clients yet. Create first client above.")}</p>'
+        rows = f'<tr><td colspan="8" style="text-align:center;color:var(--muted)">{tr("Пока нет клиентов.","No clients yet.")}</td></tr>'
 
     page_html = f"""
     <div class="container">
     {nav('clients')}
     {msg}
-    <div class="card">
-    <h2>{tr("VPN-клиенты", "VPN Clients")}</h2>
-    <form method="post" class="form-row" style="margin-bottom:16px">
-    <input type="hidden" name="action" value="add">
-    <input type="text" name="name" placeholder="{tr('Имя нового клиента', 'New client name')}" pattern="[A-Za-z0-9_\\-]+" required>
-    <button class="btn btn-primary" type="submit">{tr("Добавить", "Add")}</button>
-    {hlp("Создать нового VPN-клиента (роутер/устройство). Имя — латиница, цифры, _ и -. После создания выдай команду установки на роутер.", "Create a new VPN client (router/device). Name: letters, digits, _ and -. After creation, run the install command on the router.")}
-    </form>
-    <p style="font-size:.82em;color:var(--muted);margin:-6px 0 12px">⚡ {tr("Скорость на устройстве клиента (с включённым VPN)","Speed on the client device (VPN on)")}: <code>http://{server_tunnel_ip()}:{panel_port()}/speedtest</code></p>
-    <div class="clist">{rows}</div>
+    <div class="card" style="padding:18px 20px">
+    <div class="chead"><div><span style="font-size:1.25em;font-weight:700">{tr("Клиенты","Clients")}</span> <span class="cnt2">{len(clients)}</span></div>
+      <div style="display:flex;gap:10px"><input id="csearch" type="search" placeholder="{tr("Поиск...","Search...")}" oninput="filterC(this.value)" style="width:220px">
+      <button class="btn btn-primary" onclick="openM('m-add')">+ {tr("Добавить","Add")}</button></div></div>
+    <div class="table-wrap"><table class="ctable" id="ctable"><tr><th>{tr("Клиент","Client")}</th><th>{tr("Статус","Status")}</th>
+      <th>{tr("Сервер","Server")} <a href="#" onclick="toggleBlur();return false" title="show/hide" style="color:var(--muted);text-decoration:none">◉</a></th>
+      <th>{tr("Срок","Expiry")}</th><th>{tr("Скорость","Speed")}</th><th>{tr("Трафик за месяц","Traffic / month")}</th><th>{tr("Уведомления","Notify")}</th><th>WARP</th><th>{tr("Действия","Actions")}</th></tr>
+    {rows}</table></div>
+    <p style="font-size:.78em;color:var(--muted);margin-top:12px">⚡ {tr("Скорость на устройстве клиента","Speed on the client device")}: <code>http://{server_tunnel_addr() or "10.25.0.1"}:{panel_port()}/speedtest</code></p>
     </div>
-    </div>"""
+    <div class="modal" id="m-add"><div class="mbox"><div class="mh"><h3>{tr("Новый клиент","New client")}</h3><button class="x" onclick="closeM('m-add')">×</button></div>
+      <form method="post" class="mb"><input type="hidden" name="action" value="add">
+      <label>{tr("Имя (латиница, цифры, _ и -)","Name (latin, digits, _ and -)")}<input name="name" pattern="[A-Za-z0-9_\\-]+" required></label>
+      <div class="mf"><button class="btn btn-primary" type="submit">{tr("Создать","Create")}</button></div></form></div></div>
+    {modals}
+    </div>
+    <script>
+    function openM(id){{document.getElementById(id).classList.add('show')}}
+    function closeM(id){{document.getElementById(id).classList.remove('show')}}
+    document.addEventListener('keydown',function(e){{if(e.key==='Escape')document.querySelectorAll('.modal.show').forEach(function(m){{m.classList.remove('show')}})}});
+    document.querySelectorAll('.modal').forEach(function(m){{m.addEventListener('mousedown',function(e){{if(e.target===m)m.classList.remove('show')}})}});
+    function filterC(q){{q=q.toLowerCase();document.querySelectorAll('tr.crow').forEach(function(r){{r.style.display=(r.dataset.q||'').indexOf(q)<0?'none':''}})}}
+    function toggleBlur(){{var b=document.getElementById('ctable').classList.toggle('blur');try{{localStorage.setItem('cblur',b?'1':'0')}}catch(e){{}}}}
+    try{{if(localStorage.getItem('cblur')!=='0')document.getElementById('ctable').classList.add('blur')}}catch(e){{}}
+    function saveEdit(cid,f){{
+      var jobs=[],map={{display_name:'rename_client',server_ip:'assign_server',pinned:'set_pinned',expiry:'set_expiry',limit_mbit:'set_limit',preset_id:'set_preset',fw_list:'set_fw'}};
+      Object.keys(map).forEach(function(n){{var el=f.elements[n];if(el&&el.value!==el.dataset.o){{var d={{action:map[n],client_id:cid}};d[n]=el.value;jobs.push(d)}}}});
+      var err=document.getElementById('err-'+cid);err.textContent='';
+      if(!jobs.length){{closeM('me-'+cid);return false}}
+      var btn=f.querySelector('button[type=submit]');btn.disabled=true;
+      (function next(i){{if(i>=jobs.length){{location.reload();return}}
+        fetch(location.pathname,{{method:'POST',body:new URLSearchParams(jobs[i]),credentials:'same-origin'}}).then(function(r){{return r.text()}}).then(function(h){{
+          var m=new DOMParser().parseFromString(h,'text/html').querySelector('.alert-error');if(m){{err.textContent=m.textContent;btn.disabled=false;return}}next(i+1)}}).catch(function(e){{err.textContent=String(e);btn.disabled=false}})}})(0);
+      return false}}
+    function loadConn(cid,tab){{
+      var box=document.getElementById('cb-'+cid);box.innerHTML='<p style="color:var(--muted)">…</p>';
+      document.querySelectorAll('#mc-'+cid+' .tabs a').forEach(function(a){{a.classList.toggle('on',a.dataset.t===tab)}});
+      fetch('/client/'+cid+(tab==='router'?'/router-config':tab==='windows'?'/windows':tab==='macos'?'/macos':tab==='hr'?'/hr':'/phone/'+tab),{{credentials:'same-origin'}}).then(function(r){{return r.text()}}).then(function(h){{
+        var d=new DOMParser().parseFromString(h,'text/html'),c=d.querySelector('.container .card');if(!c){{box.textContent='error';return}}
+        c.querySelectorAll('h2,a.btn-sm[href="/clients"]').forEach(function(x){{if(x.tagName==='H2'||x.textContent.indexOf('←')>=0){{var p=x.closest('p');(p||x).remove()}}}});
+        c.removeAttribute('style');c.querySelectorAll('textarea').forEach(function(x){{if(x.style.height==='250px'){{var dt=document.createElement('details');dt.innerHTML='<summary style="cursor:pointer;color:var(--accent);margin:8px 0">'+'{tr("Показать полный конфиг","Show full config")}'+'</summary>';x.parentNode.insertBefore(dt,x);dt.appendChild(x)}}}});box.innerHTML=c.innerHTML}}).catch(function(e){{box.textContent=String(e)}})}}
+    </script>"""
     return render(page_html)
 
 
@@ -3120,6 +4027,16 @@ def settings_page():
             except Exception:
                 pass
         msg = f'<div class="alert alert-ok">{tr("Параметры обфускатора сохранены и отправлены на роутеры", "Obfuscator params saved and pushed to routers")} ({pushed})</div>'
+    elif request.method == "POST" and request.form.get("action") == "add_preset":
+        ok, m = add_obf_preset(request.form.get("p_name", ""), request.form.get("p_ports", ""),
+                               request.form.get("p_masking", "AUTO"), request.form.get("p_dummy", "4"),
+                               request.form.get("p_idle", "300"))
+        msg = f'<div class="alert {"alert-ok" if ok else "alert-error"}">{html_lib.escape(m)}</div>'
+        s = load_settings()
+    elif request.method == "POST" and request.form.get("action") == "del_preset":
+        n = del_obf_preset(request.form.get("preset_id", ""))
+        msg = f'<div class="alert alert-ok">{tr("Пресет удалён, клиентов возвращено на основной", "Preset removed, clients moved back to default")}: {n}</div>'
+        s = load_settings()
     elif request.method == "POST" and request.form.get("action") == "save_srv_obf":
         masking = request.form.get("srv_masking", "AUTO").strip().upper()
         if masking not in ("AUTO", "STUN", "NONE"):
@@ -3173,7 +4090,8 @@ def settings_page():
     eps = s.get("endpoints", {})
     ep_rows = "".join(
         f'<div class="form-row"><label>{_html_attr(sv["ip"])}{" ★" if sv.get("is_primary") else ""}</label>'
-        f'<input type="text" name="ep_{_html_attr(sv["ip"])}" value="{_html_attr(eps.get(sv["ip"], ""))}" placeholder="{_html_attr(sv["ip"])}" style="width:260px"></div>'
+        f'<input type="text" name="ep_{_html_attr(sv["ip"])}" value="{_html_attr(eps.get(sv["ip"], ""))}" placeholder="{_html_attr(sv["ip"])}" style="width:260px">'
+        f' <input type="text" name="alt_{_html_attr(sv["ip"])}" value="{_html_attr(", ".join(alt_endpoints(sv["ip"])))}" placeholder="{_html_attr(tr("запасные адреса через запятую", "backup addresses, comma-separated"))}" style="width:260px"></div>'
         for sv in get_all_servers_ordered())
     _cu = f"{panel_base_url()}/server/phobos-cascade.sh"
     cascade_cmd = f"SELF_URL={_cu} bash &lt;(curl -kfsSL {_cu}) enable {SERVER_IP} {_load_server_env().get('OBFUSCATOR_PORTS', '2083,5443,993')}"
@@ -3247,7 +4165,7 @@ def settings_page():
       <b style="color:#22c55e">stable</b> — {tr("стабильная","stable")} ·
       <b style="color:#eab308">beta</b> — {tr("тест","testing")} ·
       <b style="color:#f97316">dev</b> — {tr("разработка","development")}.
-      {tr("С 1.4.0 все каналы открыты и берутся с git.bobyrev.com (GitHub — запасной). Токен больше не нужен.","Since 1.4.0 all channels are open and served from git.bobyrev.com (GitHub as fallback). No token needed.")}</p>
+      {tr("stable — открытый, берётся с GitHub (adleibzon-rgb), запасной — git.bobyrev.com. beta и dev — для подписчиков Boosty: нужен токен подписчика (поле ниже).","stable is open, served from GitHub (adleibzon-rgb) with git.bobyrev.com as fallback. beta and dev are for Boosty subscribers and need a subscriber token (field below).")}</p>
     <form method="post" class="form-row" style="margin-bottom:8px">
       <input type="hidden" name="action" value="save_token">
       <input type="password" name="gh_token" placeholder="{tr('токен подписчика (для beta/dev)','subscriber token (for beta/dev)')}" style="width:240px" autocomplete="off">
@@ -3309,6 +4227,22 @@ def settings_page():
       <label>max-dummy <input type="number" name="srv_max_dummy" value="{_html_attr(srv_obf['max-dummy'])}" min="0" max="255" style="width:70px;padding:5px"></label>
       <label>idle (s) <input type="number" name="srv_idle" value="{_html_attr(srv_obf['idle-timeout'])}" min="10" max="3600" style="width:80px;padding:5px"></label>
       <button class="btn btn-primary btn-sm" type="submit">{tr("Сохранить и перезапустить","Save & restart")}</button>
+    </form>
+    </div>
+
+    <div class="card">
+    <h2>{tr("Пресеты обфускатора","Obfuscator presets")} {hlp("Свой набор портов и ключ на группу клиентов: утёк пакет одного — остальные не затронуты. Пресет назначается клиенту в таблице «Клиенты». Работает на этом (основном) сервере; после смены пресета телефону нужно заново импортировать ссылку, роутер получит настройки сам.","Own ports and key for a group of clients: a leaked package does not expose the others. Assign a preset to a client in the Clients table. Applies to this (primary) server; after changing a preset a phone must re-import its link, routers update on their own.")}</h2>
+    <table><tr><th>{tr("Имя","Name")}</th><th>{tr("Порты (UDP)","Ports (UDP)")}</th><th>masking</th><th>dummy</th><th>idle</th><th>{tr("Клиентов","Clients")}</th><th></th></tr>
+    {"".join(f'<tr><td>{html_lib.escape(p["name"])}</td><td>{p["ports"]}</td><td>{p["masking"]}</td><td>{p["max_dummy"]}</td><td>{p["idle"]}</td><td>{sum(1 for v in s.get("client_presets", {}).values() if v == p["id"])}</td><td><form method="post" onsubmit="return confirm(&#39;{tr("Удалить пресет? Его клиенты вернутся на основной набор.","Delete preset? Its clients go back to the default set.")}&#39;)"><input type="hidden" name="action" value="del_preset"><input type="hidden" name="preset_id" value="{p["id"]}"><button class="btn btn-danger btn-sm" type="submit">{tr("Удалить","Del")}</button></form></td></tr>' for p in s.get("obf_presets", [])) or f'<tr><td colspan="7" style="color:var(--muted)">{tr("Пока только основной набор","Default set only")}</td></tr>'}
+    </table>
+    <form method="post" class="form-row" style="flex-wrap:wrap;gap:10px;align-items:center;margin-top:10px">
+      <input type="hidden" name="action" value="add_preset">
+      <label>{tr("Имя","Name")} <input name="p_name" required maxlength="32" style="width:130px;padding:5px"></label>
+      <label>{tr("Порты","Ports")} <input name="p_ports" required placeholder="2200,2201" style="width:130px;padding:5px"></label>
+      <label>masking <select name="p_masking" style="background:var(--bg);border:1px solid var(--border);color:var(--text);padding:5px;border-radius:6px"><option>AUTO</option><option>STUN</option><option>NONE</option></select></label>
+      <label>dummy <input type="number" name="p_dummy" value="4" min="0" max="255" style="width:70px;padding:5px"></label>
+      <label>idle <input type="number" name="p_idle" value="300" min="10" max="3600" style="width:80px;padding:5px"></label>
+      <button class="btn btn-primary btn-sm" type="submit">{tr("Добавить пресет","Add preset")}</button>
     </form>
     </div>
 
@@ -3530,8 +4464,10 @@ def secondary_api_request(server, path, data=None, timeout=10):
 
 def install_command(token, port=None):
     port = port or panel_port()
-    primary = f"{panel_scheme()}://{SERVER_IP}:{port}/init/{token}.sh"
-    urls = [primary, f"http://{SERVER_IP}/init/{token}.sh"]
+    host = client_endpoint(SERVER_IP)   # domain if one is set for clients, else the IP
+    urls = [f"{panel_scheme()}://{host}:{port}/init/{token}.sh", f"http://{host}/init/{token}.sh"]
+    if host != SERVER_IP:
+        urls += [f"{panel_scheme()}://{SERVER_IP}:{port}/init/{token}.sh", f"http://{SERVER_IP}/init/{token}.sh"]
     return ("p=/tmp/phobos-init-$$.sh; ok=0; "
             f"for u in {' '.join(urls)}; do "
             "rm -f $p; "
@@ -3723,6 +4659,101 @@ def download_apk():
     return redirect(f"{PCA_GIT}/releases/download/{APK_TAG}/PhobosWG.apk")
 
 
+MAC_PKG_URL = "https://git.bobyrev.com/PCA/PCA_Phobos-dev/releases/download/macos-1.4.3/PCA-Phobos-Mac-1.4.3.pkg"
+
+
+def apple_apps():
+    """iPhone / macOS apps are for beta and dev subscribers only; stable shows Android, Windows, Router, HR."""
+    return _channel_of(panel_version()) != "stable"
+
+
+WIN_ZIP_URL = "https://git.bobyrev.com/PCA/PCA_Phobos-dev/releases/download/windows-1.4.5-beta/PCA-Phobos-Windows-1.4.5-beta.zip"
+
+
+@app.route("/download/windows")
+@auth_required
+def download_windows():
+    """Windows client archive: private beta release on Gitea, fetched with the subscriber token saved in the panel."""
+    import urllib.request
+    try:
+        tok = Path(GH_TOKEN_FILE).read_text().strip()
+    except Exception:
+        tok = ""
+    if not tok:
+        return (tr("Нужен токен подписчика: Настройки → Версия и обновления → «токен подписчика».", "Subscriber token needed: Settings → Version and updates → subscriber token."), 403)
+    try:
+        r = urllib.request.urlopen(urllib.request.Request(WIN_ZIP_URL, headers={"Authorization": "token " + tok}), timeout=30)
+    except Exception as e:
+        return (f"download failed: {e}", 502)
+    def gen():
+        while True:
+            b = r.read(65536)
+            if not b:
+                break
+            yield b
+    return app.response_class(gen(), mimetype="application/zip", headers={
+        "Content-Disposition": "attachment; filename=PCA-Phobos-Windows-1.4.5-beta.zip",
+        "Content-Length": r.headers.get("Content-Length", "")})
+
+
+@app.route("/download/macos")
+@auth_required
+def download_macos():
+    """macOS installer (.pkg): private beta release on Gitea, fetched with the subscriber token saved in the panel."""
+    import urllib.request
+    if not apple_apps():
+        return ("macOS app is available in beta/dev", 404)
+    try:
+        tok = Path(GH_TOKEN_FILE).read_text().strip()
+    except Exception:
+        tok = ""
+    if not tok:
+        return (tr("Нужен токен подписчика: Настройки → Версия и обновления → «токен подписчика».", "Subscriber token needed: Settings → Version and updates → subscriber token."), 403)
+    try:
+        r = urllib.request.urlopen(urllib.request.Request(MAC_PKG_URL, headers={"Authorization": "token " + tok}), timeout=30)
+    except Exception as e:
+        return (f"download failed: {e}", 502)
+    def gen():
+        while True:
+            b = r.read(65536)
+            if not b:
+                break
+            yield b
+    return app.response_class(gen(), mimetype="application/octet-stream", headers={
+        "Content-Disposition": "attachment; filename=" + MAC_PKG_URL.rsplit("/", 1)[1],
+        "Content-Length": r.headers.get("Content-Length", "")})
+
+
+@app.route("/client/<cid>/macos")
+@auth_required
+def client_macos(cid):
+    """macOS tab of the connection window (beta/dev): installer + phobos:// link."""
+    if not apple_apps():
+        return ("not found", 404)
+    conf, link = build_phone_config(cid, "android")
+    if conf is None or not link:
+        return ("client not found", 404)
+    steps = tr(
+        "1) Скачайте и откройте установщик (.pkg), macOS 12+ (Apple Silicon и Intel). Если macOS не даёт открыть — правый клик → «Открыть». 2) В строке меню появится значок «PCA Phobos» → «Импорт» → вставьте ссылку ниже (или файл .conf). 3) Значок → «Включить». Российские сайты идут напрямую, при блокировке UDP приложение само переходит на TCP. Команды в Терминале: <code>phobos status</code>, <code>sudo phobos on|off</code>.",
+        "1) Download and open the installer (.pkg), macOS 12+ (Apple Silicon and Intel). If macOS refuses, right-click → Open. 2) The “PCA Phobos” menu-bar icon → Import → paste the link below (or a .conf file). 3) Icon → Turn on. Russian sites go direct; if UDP is blocked the app switches to TCP by itself. Terminal: <code>phobos status</code>, <code>sudo phobos on|off</code>.")
+    copy, copied = tr("Копировать", "Copy"), tr("Скопировано", "Copied")
+    body = f"""<p><a href="/download/macos" class="btn btn-primary">⬇ {tr("Скачать PCA Phobos для macOS (.pkg)", "Download PCA Phobos for macOS (.pkg)")}</a></p>
+    <p style="color:var(--muted);font-size:.85em">{steps}</p>
+    <div style="display:flex;gap:8px;align-items:flex-start">
+    <code id="macLink" style="background:var(--bg);padding:8px 12px;border-radius:6px;display:block;font-size:.82em;word-break:break-all;max-height:120px;overflow:auto;flex:1">{html_lib.escape(link)}</code>
+    <button class="btn btn-primary btn-sm" type="button" onclick="var x=document.createElement('textarea');x.value=document.getElementById('macLink').textContent;document.body.appendChild(x);x.select();document.execCommand('copy');document.body.removeChild(x);this.textContent='{copied}'">📋 {copy}</button>
+    </div>
+    <p style="font-size:.85em;margin-top:8px"><a href="/client/{cid}/conf/android">⬇ {tr("Файл .conf", ".conf file")}</a></p>"""
+    return render(f"""
+    <div class="container">
+    {nav('clients')}
+    <div class="card">
+    <h2>{cid} — macOS</h2>
+    {body}
+    <p style="margin-top:10px"><a href="/clients" class="btn btn-sm">{tr("← назад", "← back")}</a></p>
+    </div></div>""")
+
+
 @app.route("/client/<cid>/conf/<mode>")
 @auth_required
 def client_conf_download(cid, mode):
@@ -3747,7 +4778,10 @@ def client_phone(cid, mode):
     conf, link = build_phone_config(cid, mode)
     if conf is None:
         return ("client not found", 404)
-    qr = qr_datauri(link if (mode == "android" and link) else conf)
+    _alink = link
+    if mode == "ios":
+        _alink = build_phone_config(cid, "android")[1]
+    qr = qr_datauri(link if (mode == "android" and link) else (_alink or conf))
     if mode == "android":
         title = tr("Android — PhobosWG (с обфускацией)", "Android — PhobosWG (obfuscated)")
         apk_btn = ""
@@ -3775,11 +4809,28 @@ def client_phone(cid, mode):
                  f'<p>{tr("phobos:// ссылка — импорт в PCA Phobos VPN или PhobosWG:", "phobos:// link — import into PCA Phobos VPN or PhobosWG:")} <a href="{link}">{tr("открыть", "open")}</a></p>'
                  f'<textarea readonly onclick="this.select()" style="width:100%;height:90px;font-size:.75em">{link}</textarea>'
                  f'<p style="font-size:.85em"><a href="/client/{cid}/conf/android">⬇ {tr("Файл .conf — для «Импорт из файла» в PCA Phobos VPN", ".conf file — for “Import from file” in PCA Phobos VPN")}</a>. '
-                 f'{tr("Ссылка выше подходит и для HydraRoute (формат phobos:// автора Phobos).", "The link above also works in HydraRoute (upstream phobos:// format).")}</p>')
+                 f'{tr("Для HydraRoute — отдельная вкладка HR.", "For HydraRoute use the HR tab.")}</p>')
     else:
-        title = tr("iPhone / iOS WireGuard (без обфускации)", "iPhone / iOS WireGuard (plain, no obfuscation)")
-        extra = (f'<p><a href="https://apps.apple.com/app/wireguard/id1441195209" target="_blank" rel="noopener" class="btn btn-primary" style="background:#0ea5e9">📥 {tr("WireGuard в App Store","WireGuard on the App Store")}</a> <a href="/client/{cid}/conf/ios" class="btn" style="background:#7c3aed">⬇ {tr("Скачать .conf","Download .conf")}</a></p>'
-                 f'<p style="color:var(--warn)">{tr("⚠ Обычный WireGuard без маскировки (Endpoint → :51820). На сервере должен быть открыт порт 51820 (ALLOW_PLAIN_WG=1).", "⚠ Plain WireGuard, no obfuscation (Endpoint → :51820). Port 51820 must be open on the server (ALLOW_PLAIN_WG=1).")}</p>')
+        title = tr("iPhone — PCA Phobos VPN (с обфускацией)", "iPhone — PCA Phobos VPN (obfuscated)")
+        tf = (load_settings().get("testflight_url") or "https://testflight.apple.com/join/tHqjPg1p").strip()
+        extra = (
+            f'<div style="text-align:left;max-width:560px;margin:10px auto;font-size:.92em;line-height:1.55">'
+            f'<b>{tr("Если приложение уже стоит:", "If the app is already installed:")}</b><ol style="margin:4px 0 12px 18px">'
+            f'<li>{tr("Наведи камеру iPhone на QR выше и нажми на ссылку — откроется PCA Phobos VPN. Или нажми кнопку ниже прямо на телефоне.", "Point the iPhone camera at the QR above and tap the link, or tap the button below on the phone.")}</li>'
+            f'<li>{tr("Приложение предложит импортировать профиль — подтверди.", "The app offers to import the profile — confirm.")}</li>'
+            f'<li>{tr("Нажми «Подключить» и разреши добавление VPN (один раз).", "Tap Connect and allow adding the VPN (once).")}</li>'
+            f'<li>{tr("Сервер выбирается сам: при блокировке приложение переключится на другой сервер без твоего участия.", "The server is picked automatically; if it is blocked the app switches to another one by itself.")}</li></ol>'
+            f'<b>{tr("Если приложения ещё нет:", "If the app is not installed yet:")}</b> {tr("поставь TestFlight из App Store и открой", "install TestFlight from the App Store and open")} <a href="{tf}" target="_blank" rel="noopener">{tf}</a>, {tr("потом действуй по шагам выше. Ссылку на приложение никому не передавай.", "then follow the steps above. Do not share the app link.")}</div>'
+            f'<p><a href="{_alink}" class="btn btn-primary">📱 {tr("Открыть в PCA Phobos VPN", "Open in PCA Phobos VPN")}</a> <a href="{tf}" target="_blank" rel="noopener" class="btn" style="background:#0ea5e9">TestFlight</a></p>'
+            f'<textarea readonly onclick="this.select()" style="width:100%;height:70px;font-size:.75em">{_alink}</textarea>'
+            f'<details style="margin-top:10px;text-align:left"><summary style="cursor:pointer;color:var(--accent)">{tr("Обычный WireGuard без обфускации (запасной вариант)", "Plain WireGuard, no obfuscation (fallback)")}</summary>'
+            f'<p><a href="https://apps.apple.com/app/wireguard/id1441195209" target="_blank" rel="noopener" class="btn btn-primary" style="background:#0ea5e9">📥 WireGuard</a> <a href="/client/{cid}/conf/ios" class="btn" style="background:#7c3aed">⬇ {tr("Скачать .conf","Download .conf")}</a></p>'
+            f'<p style="color:var(--warn)">{tr("⚠ Endpoint → :51820, на сервере нужен открытый порт 51820 (ALLOW_PLAIN_WG=1).", "⚠ Endpoint → :51820, port 51820 must be open on the server (ALLOW_PLAIN_WG=1).")}</p></details>')
+    if mode == "ios" and not apple_apps():
+        title = tr("iPhone — обычный WireGuard (без обфускации)", "iPhone — plain WireGuard (no obfuscation)")
+        qr = qr_datauri(conf)
+        extra = (f'<p><a href="https://apps.apple.com/app/wireguard/id1441195209" target="_blank" rel="noopener" class="btn btn-primary" style="background:#0ea5e9">📥 WireGuard</a> <a href="/client/{cid}/conf/ios" class="btn" style="background:#7c3aed">⬇ {tr("Скачать .conf","Download .conf")}</a></p>'
+                 f'<p style="color:var(--warn)">{tr("⚠ Endpoint → :51820, на сервере нужен открытый порт 51820 (ALLOW_PLAIN_WG=1). Приложение PCA Phobos VPN для iPhone (с обфускацией) — в каналах beta/dev.", "⚠ Endpoint → :51820, port 51820 must be open (ALLOW_PLAIN_WG=1). The obfuscated PCA Phobos VPN iPhone app is in beta/dev.")}</p>')
     html = f"""
     <div class="container">
     {nav('clients')}
@@ -3807,6 +4858,71 @@ def router_config(client_id):
         return ("forbidden", 403)
     conf = generate_failover_conf_for_client(client_id)
     return (conf, 200, {"Content-Type": "text/plain; charset=utf-8"})
+
+
+@app.route("/client/<cid>/windows")
+@auth_required
+def client_windows(cid):
+    """Windows tab of the connection window: phobos:// link (with pca-sub) for PCA Phobos for Windows."""
+    conf, link = build_phone_config(cid, "android")
+    if conf is None or not link:
+        return ("client not found", 404)
+    steps = tr(
+        "1) Установите «PCA Phobos для Windows» (архив из релиза beta, install.cmd от администратора). 2) Вставьте ссылку ниже: окно запроса ключа или команда <code>PCAPhobos.exe import ССЫЛКА</code>. 3) Значок в трее → включить. Смена сервера в панели подхватывается приложением само (раз в минуту); другие клиенты — только повторным импортом ссылки.",
+        "1) Install “PCA Phobos for Windows” (archive from the beta release, run install.cmd as administrator). 2) Paste the link below when asked for the key, or run <code>PCAPhobos.exe import LINK</code>. 3) Tray icon → turn on. The app follows server changes from the panel by itself (every minute); other clients need the link re-imported.")
+    copy, copied = tr("Копировать", "Copy"), tr("Скопировано", "Copied")
+    body = f"""<p><a href="/download/windows" class="btn btn-primary">⬇ {tr("Скачать PCA Phobos для Windows (zip)", "Download PCA Phobos for Windows (zip)")}</a> <span style="color:var(--muted);font-size:.8em">{tr("в архиве: PCAPhobos — весь трафик кроме РФ, PCAPhobosTG — только Telegram", "archive: PCAPhobos — all but RU, PCAPhobosTG — Telegram only")}</span></p>
+    <p style="color:var(--muted);font-size:.85em">{steps}</p>
+    <div style="display:flex;gap:8px;align-items:flex-start">
+    <code id="winLink" style="background:var(--bg);padding:8px 12px;border-radius:6px;display:block;font-size:.82em;word-break:break-all;max-height:120px;overflow:auto;flex:1">{html_lib.escape(link)}</code>
+    <button class="btn btn-primary btn-sm" type="button" onclick="var x=document.createElement('textarea');x.value=document.getElementById('winLink').textContent;document.body.appendChild(x);x.select();document.execCommand('copy');document.body.removeChild(x);this.textContent='{copied}'">📋 {copy}</button>
+    </div>"""
+    html = f"""
+    <div class="container">
+    {nav('clients')}
+    <div class="card">
+    <h2>{cid} — Windows</h2>
+    {body}
+    <p style="margin-top:10px"><a href="/clients" class="btn btn-sm">{tr("← назад", "← back")}</a></p>
+    </div></div>"""
+    return render(html)
+
+
+def build_hr_link(cid):
+    """phobos:// link strictly per the upstream spec (docs/phobos-link-format.md) for HydraRoute:
+    no pca-* comment lines (HR drops them anyway, and pca-sub carries a panel token), every mandatory field padded with "= none"."""
+    import base64, urllib.parse
+    conf, _link = build_phone_config(cid, "android")
+    if conf is None:
+        return None
+    conf = _pad_conf_with_none("\n".join(ln for ln in conf.split("\n") if not ln.lstrip().startswith("#")))
+    return "phobos://" + base64.urlsafe_b64encode(conf.encode()).decode().rstrip("=") + "#" + urllib.parse.quote(cid or "none")
+
+
+@app.route("/client/<cid>/hr")
+@auth_required
+def client_hr(cid):
+    """HR tab of the connection window: link for HydraRoute Neo on a Keenetic."""
+    link = build_hr_link(cid)
+    if not link:
+        return ("client not found", 404)
+    steps = tr(
+        "HydraRoute Neo на роутере: «Сеть» → «+ Интерфейс» → тип OpkgTun → вставьте ссылку в поле «Ссылки» → «Создать интерфейс». Через HydraRoute идёт один сервер по UDP: резервного TCP-канала и автоперехода между серверами нет. Один клиент — одно устройство: не используйте эту же учётку на телефоне.",
+        "HydraRoute Neo on the router: Network → + Interface → type OpkgTun → paste the link into Links → Create interface. HydraRoute uses one server over UDP: no TCP fallback and no failover between servers. One client — one device: do not use the same client on a phone.")
+    copy, copied = tr("Копировать", "Copy"), tr("Скопировано", "Copied")
+    html = f"""
+    <div class="container">
+    {nav('clients')}
+    <div class="card">
+    <h2>{cid} — HydraRoute</h2>
+    <p style="color:var(--muted);font-size:.85em">{steps}</p>
+    <div style="display:flex;gap:8px;align-items:flex-start">
+    <code id="hrLink" style="background:var(--bg);padding:8px 12px;border-radius:6px;display:block;font-size:.82em;word-break:break-all;max-height:120px;overflow:auto;flex:1">{html_lib.escape(link)}</code>
+    <button class="btn btn-primary btn-sm" type="button" onclick="var x=document.createElement('textarea');x.value=document.getElementById('hrLink').textContent;document.body.appendChild(x);x.select();document.execCommand('copy');document.body.removeChild(x);this.textContent='{copied}'">📋 {copy}</button>
+    </div>
+    <p style="margin-top:10px"><a href="/clients" class="btn btn-sm">{tr("← назад", "← back")}</a></p>
+    </div></div>"""
+    return render(html)
 
 
 @app.route("/client/<cid>/router-config")
@@ -4410,7 +5526,7 @@ def api_client_remove():
         except Exception:
             pass
     s = load_settings()
-    for key in ("router_access", "client_assignments"):
+    for key in ("router_access", "client_assignments", "client_pinned"):
         d = s.get(key, {})
         if cid in d:
             del d[cid]
@@ -4476,6 +5592,23 @@ def servers_page():
                     save_settings(s)
                 synced = sync_missing_peers_to_secondaries(servers[-1])
                 msg = f'<div class="alert alert-ok">Сервер {ip} добавлен, синхронизировано {synced} клиентов</div>'
+
+        elif action == "set_domain":
+            ip = request.form.get("ip", "").strip()
+            host = request.form.get("domain", "").strip().lower()
+            form = {"ep_" + sv["ip"]: client_endpoint(sv["ip"]) for sv in get_all_servers_ordered()}
+            form = {k: ("" if v == k[3:] else v) for k, v in form.items()}
+            form["ep_" + ip] = host
+            ok, m = save_client_endpoints(form)
+            warn = ""
+            if ok and host:
+                import socket
+                try:
+                    if ip not in socket.gethostbyname_ex(host)[2]:
+                        warn = " " + tr("⚠ Домен сейчас указывает не на этот сервер — проверь A-запись.", "⚠ The domain does not point to this server right now — check the A record.")
+                except OSError:
+                    warn = " " + tr("⚠ Домен не резолвится — создай A-запись на IP сервера.", "⚠ The domain does not resolve — create an A record to the server IP.")
+            msg = f'<div class="alert {"alert-ok" if ok else "alert-error"}">{html_lib.escape(m)}{html_lib.escape(warn)}</div>'
 
         elif action == "remove":
             ip = request.form.get("ip", "").strip()
@@ -4660,10 +5793,14 @@ def servers_page():
             usable = [ip for ip in server_ips if base_load[ip] < 0.99] or server_ips
             placed = {ip: 0 for ip in server_ips}
             PEN = 0.08  # extra load each assigned client adds to a server's score
-            assignments = {}
+            pinned = s.get("client_pinned", {})
+            old_as = s.get("client_assignments", {})
+            assignments = {cid: ip for cid, ip in old_as.items() if pinned.get(cid)}
             rb_err = []
             for c in clients:
                 cid = c["client_id"]
+                if cid in assignments:
+                    continue  # закреплён за сервером — не двигаем
                 target = min(usable, key=lambda ip: base_load[ip] + placed[ip] * PEN)
                 placed[target] += 1
                 assignments[cid] = target
@@ -4783,6 +5920,8 @@ def servers_page():
         rows += f"""<tr>
         <td>{prio}{ip}{ptag}</td><td>{ports}</td><td>{peers_val}</td><td>{assigned}</td>
         <td><span class="badge {st_class}">{st_text}</span></td>
+        <td><form method="post" style="display:flex;gap:4px;margin:0"><input type="hidden" name="action" value="set_domain"><input type="hidden" name="ip" value="{ip}">
+          <input name="domain" value="{_html_attr(client_endpoint(ip) if client_endpoint(ip) != ip else '')}" placeholder="vpn.example.com" style="width:170px;padding:5px 8px"><button class="btn btn-primary btn-sm" type="submit">OK</button></form></td>
         <td><form method="post" style="display:inline"><input type="hidden" name="ip" value="{ip}">{mv} {term_btn} {acts}</form></td>
         </tr>"""
 
@@ -4860,7 +5999,7 @@ def servers_page():
     <div class="card">
     <h2>{tr("Приоритет серверов и балансировка", "Server Priority & Load Balancing")} {hlp("У каждого клиента есть основной сервер. При сбое роутер сам перебирает серверы сверху вниз. Стрелки меняют общий порядок резервирования. Роутеры за NAT подтягивают конфиг сами — ручных действий не нужно.", "Each client has a primary server. On failure the router tries servers top-to-bottom by itself. Arrows change the global fallback order. NAT routers pull config themselves — no manual action needed.")}</h2>
     <div class="table-wrap"><table class="wide-table">
-    <tr><th>{tr("Сервер","Server")}</th><th>{tr("Порты","Ports")}</th><th>Peers</th><th>{tr("Назначено","Assigned")}</th><th>{tr("Статус","Status")}</th><th>{tr("Действия","Actions")}</th></tr>
+    <tr><th>{tr("Сервер","Server")}</th><th>{tr("Порты","Ports")}</th><th>Peers</th><th>{tr("Назначено","Assigned")}</th><th>{tr("Статус","Status")}</th><th>{tr("Домен для клиентов","Client domain")} {hlp("Если у сервера есть домен, впиши его — клиенты, ссылки для телефонов, роутеры и команда установки будут использовать его вместо IP. Нужна A-запись домена на IP сервера. Пусто — используется IP.","If the server has a domain, enter it - clients, phone links, routers and the install command will use it instead of the IP. Needs an A record pointing to the server IP. Empty = the IP is used.")}</th><th>{tr("Действия","Actions")}</th></tr>
     {rows}
     </table></div>
     <div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap;align-items:center">

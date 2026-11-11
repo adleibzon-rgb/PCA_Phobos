@@ -23,6 +23,20 @@ resolve_install_names() {
   fi
 
   if [ -f "$binary_path" ] && [ -f "$PHOBOS_DIR/${CLIENT_NAME}.conf" ]; then
+    # 02.11.2026: переустановка — берём те же имена, что у этой учётки (по *.link),
+    # иначе доп. учётка затёрла бы обфускатор главной
+    local l n sc
+    for l in "$PHOBOS_DIR"/wg-obfuscator?*.link; do
+      [ "$(cat "$l" 2>/dev/null)" = "${CLIENT_NAME}" ] || continue
+      n=$(basename "$l" .link); n=${n#wg-obfuscator}
+      sc=$(grep -l "/wg-obfuscator${n}.conf\"\$" /opt/etc/init.d/S*wg-obfuscator 2>/dev/null | head -1)
+      OBF_BINARY_NAME="wg-obfuscator${n}"
+      OBF_CONF_NAME="wg-obfuscator${n}.conf"
+      OBF_INIT_NAME=$(basename "${sc:-S50wg-obfuscator}")
+      OBF_SERVICE_NAME="phobos-obfuscator${n}"
+      OBF_WG_IFACE="phobos${n}"
+      return
+    done
     return
   fi
 

@@ -173,6 +173,48 @@ def speedtest():
         return jsonify({"error": str(e)}), 500
 
 
+
+# --- Google geo (09.30): how Google sees the server's addresses ---------------
+GOOGLE_CLOSED = {"Russia", "Belarus", "China", "Iran", "Hong Kong", "North Korea", "Cuba", "Syria"}
+
+
+def _google_country(*args):
+    """«Country version» at the bottom of policies.google.com/terms = the country Google assigns to the address."""
+    import re as _re
+    import subprocess as _sp
+    try:
+        html = _sp.run(["curl", *args, "-s", "-m", "15", "https://policies.google.com/terms?hl=en"],
+                       capture_output=True, text=True, timeout=25).stdout
+        m = _re.search(r"Country version:\s*</a>\s*([A-Za-z][A-Za-z .'-]*?)\s*<", html)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+def google_geo():
+    """v4/v6 = default route (what clients exit with); ips = every public IPv4 on the server."""
+    import re as _re
+    import subprocess as _sp
+    import time as _t
+    out = {"v4": _google_country("-4"), "v6": _google_country("-6"), "ips": {}, "ts": int(_t.time())}
+    try:
+        for line in _sp.run(["ip", "-4", "-o", "addr", "show", "scope", "global"], capture_output=True,
+                            text=True, timeout=10).stdout.splitlines():
+            ip = line.split()[3].split("/")[0]
+            if not _re.match(r"^(10|127|172\.(1[6-9]|2\d|3[01])|192\.168|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7]))\.", ip):
+                out["ips"][ip] = _google_country("-4", "--interface", ip)
+    except Exception:
+        pass
+    return out
+
+
+@app.route("/api/google-geo")
+def api_google_geo():
+    if not check_api_key():
+        return jsonify({"error": "unauthorized"}), 401
+    return jsonify(google_geo())
+
+
 @app.route("/api/limits", methods=["POST"])
 def set_limits():
     """Per-client speed limits pushed by the main panel ("<tunnel_ip> <mbit>" lines)."""

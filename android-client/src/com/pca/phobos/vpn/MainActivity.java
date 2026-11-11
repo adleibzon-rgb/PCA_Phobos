@@ -56,6 +56,7 @@ import java.util.concurrent.Executors;
  */
 public class MainActivity extends Activity {
     static final int LPORT = 13255;
+    static final String ACTION_TOGGLE = "com.pca.phobos.vpn.TOGGLE";
     static final String MODE_ALL = "all", MODE_ONLY = "only", MODE_EXCEPT = "except";
 
     static GoBackend backend;
@@ -63,6 +64,15 @@ public class MainActivity extends Activity {
     static final int TCP_LPORT = 13256;
     static volatile String transport = "";      // "UDP" | "TCP" | "Облако" while up
     static WsRelay wsRelay;
+    static V6Relay v6Relay;
+    static final int V6_LPORT = 13257;
+    static final Object LOCK = new Object();
+    /** Panel subscription (# pca-sub): servers in the panel's order, IPv6 entries last; failover walks them round-robin. */
+    static org.json.JSONArray sub = new org.json.JSONArray();
+    static volatile int subIndex;
+    static volatile String curConf = "";         // profile pointed at the server in use
+    static volatile long watchGen;               // bumped on connect/disconnect: stops the old watcher
+    static final long SILENCE_MS = 40000;        // no server reply this long -> next server
     static final Tunnel TUNNEL = new Tunnel() {
         public String getName() { return "phobos"; }
         public void onStateChange(Tunnel.State s) { }
@@ -72,7 +82,7 @@ public class MainActivity extends Activity {
     private final Handler ui = new Handler(Looper.getMainLooper());
     private SharedPreferences prefs;
     private boolean dark;
-    private TextView status, traffic;
+    private TextView status, traffic, server;
     private Button power;
     private long lastRx, lastTx, lastT;
 
@@ -82,6 +92,9 @@ public class MainActivity extends Activity {
         prefs = getSharedPreferences("vpn", MODE_PRIVATE);
         dark = (getResources().getConfiguration().uiMode & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
         if (backend == null) backend = new GoBackend(getApplicationContext());
+        if (android.os.Build.VERSION.SDK_INT >= 33 && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, 8);
+        }
         handleIntent(getIntent());
         render();
     }
@@ -94,6 +107,14 @@ public class MainActivity extends Activity {
     }
 
     private void handleIntent(Intent i) {
+        if (i != null && ACTION_TOGGLE.equals(i.getAction())) {
+            setIntent(new Intent());
+            // tile: toggle and get out of the way, unless Android must ask for the VPN permission first
+            if (!isUp() && !prefs.getString("conf", "").isEmpty() && VpnService.prepare(this) == null) { bg.execute(this::up); finish(); return; }
+            if (isUp()) { bg.execute(this::down); finish(); return; }
+            toggle();
+            return;
+        }
         if (i != null && i.getData() != null && "phobos".equals(i.getData().getScheme())) {
             importLink(i.getDataString());
         }
@@ -140,16 +161,21 @@ public class MainActivity extends Activity {
 
     // ── profile ───────────────────────────────────────────────────────────
     /** phobos://<urlsafe-base64 of conf>#name  (format produced by the PCA Phobos panel). */
-    private void importLink(String link) {
+    private void importLink(String link) { importText(link, "Phobos"); }
+
+    /** A phobos:// link, or the text of a client .conf ([Interface] + [Peer] + [instance]). */
+    private void importText(String text, String name) {
         try {
-            String s = link.trim();
-            String name = "Phobos";
-            int hash = s.indexOf('#');
-            if (hash > 0) { name = Uri.decode(s.substring(hash + 1)); s = s.substring(0, hash); }
-            s = s.replaceFirst("^phobos://", "").trim();
-            String conf = new String(Base64.decode(s, Base64.URL_SAFE | Base64.NO_WRAP | Base64.NO_PADDING), StandardCharsets.UTF_8);
-            if (!conf.contains("[Interface]") || !conf.contains("[instance]")) throw new IllegalArgumentException("not a Phobos config");
-            Config.parse(new BufferedReader(new StringReader(wgPart(conf, MODE_ALL, ""))));  // validate
+            String s = text.replace("\uFEFF", "").trim(), conf = s;
+            if (s.startsWith("phobos://")) {
+                int hash = s.indexOf('#');
+                if (hash > 0) { name = Uri.decode(s.substring(hash + 1)); s = s.substring(0, hash); }
+                s = s.replaceFirst("^phobos://", "").trim();
+                conf = new String(Base64.decode(s, Base64.URL_SAFE | Base64.NO_WRAP | Base64.NO_PADDING), StandardCharsets.UTF_8);
+            }
+            if (!conf.contains("[Interface]") || !conf.contains("[instance]"))
+                throw new IllegalArgumentException("нужен конфиг Phobos: секции [Interface], [Peer] и [instance]");
+            Config.parse(new BufferedReader(new StringReader(wgPart(conf, MODE_ALL, "", false))));  // validate
             prefs.edit().putString("conf", conf).putString("name", name).apply();
             toast("Профиль «" + name + "» импортирован");
         } catch (Exception e) {
@@ -174,13 +200,15 @@ public class MainActivity extends Activity {
     private static String key(String line) { return line.substring(0, line.indexOf('=')).trim().toLowerCase(); }
     private static String val(String line) { return line.substring(line.indexOf('=') + 1).trim(); }
 
-    String wgPart(String conf, String mode, String apps) {
+    String wgPart(String conf, String mode, String apps, boolean ruRoutes) {
         StringBuilder sb = new StringBuilder("[Interface]\n");
         for (String ln : section(conf, "[Interface]")) {
             String k = key(ln);
             if (k.equals("excludedapplications") || k.equals("includedapplications")) continue;
+            if (k.equals("dns") && !myDns().isEmpty()) continue;
             sb.append(ln).append('\n');
         }
+        if (!myDns().isEmpty()) sb.append("DNS = ").append(myDns()).append('\n');
         List<String> sel = new ArrayList<>();
         for (String a : apps.split(",")) if (!a.trim().isEmpty()) sel.add(a.trim());
         if (MODE_ONLY.equals(mode) && !sel.isEmpty()) {
@@ -193,7 +221,7 @@ public class MainActivity extends Activity {
             sb.append("ExcludedApplications = ").append(String.join(", ", ex)).append('\n');
         }
         sb.append("\n[Peer]\n");
-        String ruBypass = prefs != null && prefs.getBoolean("ru_direct", true) ? ruBypassAllowedIps() : null;
+        String ruBypass = ruRoutes && prefs.getBoolean("ru_direct", true) ? ruBypassAllowedIps() : null;
         for (String ln : section(conf, "[Peer]")) {
             if (key(ln).equals("endpoint")) ln = "Endpoint = 127.0.0.1:" + LPORT;
             if (key(ln).equals("allowedips") && ruBypass != null) ln = "AllowedIPs = " + ruBypass;
@@ -202,33 +230,40 @@ public class MainActivity extends Activity {
         return sb.toString();
     }
 
-    private String ruCache;
-
-    /** Internet minus Russian networks (assets/ru_bypass.txt, generated from ipdeny). */
+    /** Internet minus Russian networks (assets/ru_nets.txt) and the user's own sites; resolves domains, so not on the UI thread. */
     private String ruBypassAllowedIps() {
-        if (ruCache != null) return ruCache;
+        List<String> ru = new ArrayList<>();
         try (BufferedReader r = new BufferedReader(new java.io.InputStreamReader(
-                getAssets().open("ru_bypass.txt"), StandardCharsets.UTF_8))) {
+                getAssets().open("ru_nets.txt"), StandardCharsets.UTF_8))) {
             for (String ln; (ln = r.readLine()) != null; ) {
-                if (!ln.startsWith("#") && ln.contains("/")) { ruCache = ln.trim(); break; }
+                if (!ln.startsWith("#") && ln.contains("/")) for (String c : ln.split(",")) ru.add(c.trim());
             }
-        } catch (Exception e) { log("ru_bypass: " + e); }
-        return ruCache;
+        } catch (Exception e) { log("ru_nets: " + e); }
+        return RuNets.allowed(ru, lines(prefs.getString("my_direct", "")), lines(prefs.getString("my_vpn", "")));
     }
+
+    private static List<String> lines(String s) {
+        List<String> out = new ArrayList<>();
+        for (String l : s.split("[\\n,\\s]+")) if (!l.trim().isEmpty()) out.add(l.trim());
+        return out;
+    }
+
+    /** User's own DNS servers ("1.1.1.1, 8.8.8.8"); empty = the profile's. */
+    private String myDns() { return prefs.getString("dns", ""); }
 
     private static String getPackageNameSafe() { return "com.pca.phobos.vpn"; }
 
     private static final java.util.Set<String> OBF_KEYS = new java.util.HashSet<>(java.util.Arrays.asList(
             "target", "key", "masking", "idle-timeout", "max-dummy", "static-bindings", "max-clients", "target-if", "allow-clean", "in-timeout", "resolve-interval"));
 
-    private String obfPart(String conf, boolean viaRelay) {
+    private String obfPart(String conf, String targetOverride) {
         StringBuilder sb = new StringBuilder("[instance]\nsource-if = 127.0.0.1\nsource-lport = " + LPORT + "\n");
         for (String ln : section(conf, "[instance]")) {
             String k = key(ln);
             if (k.equals("source-if") || k.equals("source-lport") || k.equals("verbose")) continue;
             // configs from other Phobos builds carry keys our wg-obfuscator v1.6 rejects (obfuscate-bytes…)
             if (!OBF_KEYS.contains(k)) continue;
-            if (viaRelay && k.equals("target")) ln = "target = 127.0.0.1:" + TCP_LPORT;
+            if (targetOverride != null && k.equals("target")) ln = "target = " + targetOverride;
             sb.append(ln).append('\n');
         }
         sb.append("verbose = INFO\n");
@@ -255,14 +290,88 @@ public class MainActivity extends Activity {
         return "";
     }
 
+    /** "# pca-sub = http://panel/api/phone-sub/<client>?token=…" */
+    private static String subUrl(String conf) {
+        for (String ln : conf.split("\n")) {
+            String t = ln.trim();
+            if (t.startsWith("#") && t.contains("pca-sub") && t.contains("=")) return val(t);
+        }
+        return "";
+    }
+
+    /** Same profile pointed at another subscription server (address, obfuscator key, server WG key, TCP port). */
+    static String applying(String conf, org.json.JSONObject s) {
+        String host = s.optString("host"), sec = "";
+        if (host.contains(":")) host = "[" + host + "]";
+        StringBuilder sb = new StringBuilder();
+        for (String raw : conf.split("\n", -1)) {
+            String ln = raw.trim();
+            if (ln.startsWith("[") && ln.endsWith("]")) sec = ln.toLowerCase();
+            else if (ln.startsWith("#")) { if (ln.contains("pca-tcp")) continue; }
+            else if (ln.contains("=")) {
+                String k = key(ln);
+                if (sec.equals("[instance]") && k.equals("target")) { sb.append("target = ").append(host).append(':').append(s.optInt("port")).append('\n'); continue; }
+                if (sec.equals("[instance]") && k.equals("key")) { sb.append("key = ").append(s.optString("key")).append('\n'); continue; }
+                if (sec.equals("[peer]") && k.equals("publickey")) { sb.append("PublicKey = ").append(s.optString("wg_pub")).append('\n'); continue; }
+            }
+            sb.append(raw).append('\n');
+        }
+        if (s.optInt("tcp") != 0) sb.append("# pca-tcp = ").append(s.optInt("tcp")).append('\n');
+        return sb.toString();
+    }
+
+    /** Pull the server list from the panel (the app is outside the tunnel); cached when the panel is unreachable. */
+    private void refreshSub(String conf) {
+        String u = subUrl(conf);
+        if (u.isEmpty()) { sub = new org.json.JSONArray(); return; }
+        try {
+            java.net.HttpURLConnection c = (java.net.HttpURLConnection) new java.net.URL(u).openConnection();
+            c.setConnectTimeout(6000); c.setReadTimeout(6000);
+            try (java.io.InputStream in = c.getInputStream()) {
+                String body = new String(readAll(in), StandardCharsets.UTF_8);
+                org.json.JSONArray a = new org.json.JSONObject(body).getJSONArray("servers");
+                if (a.length() > 0) prefs.edit().putString("sub", a.toString()).apply();
+            }
+        } catch (Exception e) { log("sub: " + e); }
+        try { sub = new org.json.JSONArray(prefs.getString("sub", "[]")); } catch (Exception e) { sub = new org.json.JSONArray(); }
+    }
+
+    private static byte[] readAll(java.io.InputStream in) throws java.io.IOException {
+        java.io.ByteArrayOutputStream o = new java.io.ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        for (int n; (n = in.read(buf)) > 0; ) o.write(buf, 0, n);
+        return o.toByteArray();
+    }
+
     private String target(String conf) {
         for (String ln : section(conf, "[instance]")) if (key(ln).equals("target")) return val(ln);
         return "?";
     }
 
     // ── connect / disconnect ──────────────────────────────────────────────
-    private boolean isUp() {
-        try { return backend.getState(TUNNEL) == Tunnel.State.UP; } catch (Exception e) { return false; }
+    private boolean isUp() { return tunnelUp(); }
+
+    static boolean tunnelUp() {
+        try { return backend != null && backend.getState(TUNNEL) == Tunnel.State.UP; } catch (Exception e) { return false; }
+    }
+
+    /** Ongoing notification = shield in the status bar while the VPN is on (GoBackend's service has none). */
+    private void notifyState(boolean up) {
+        android.app.NotificationManager nm = (android.app.NotificationManager) getSystemService(NOTIFICATION_SERVICE);
+        if (nm == null) return;
+        if (!up) { nm.cancel(1); PhobosTile.refresh(this); return; }
+        if (android.os.Build.VERSION.SDK_INT >= 26) {
+            nm.createNotificationChannel(new android.app.NotificationChannel("vpn", "VPN", android.app.NotificationManager.IMPORTANCE_LOW));
+        }
+        android.app.PendingIntent open = android.app.PendingIntent.getActivity(this, 0,
+                new Intent(this, MainActivity.class), android.app.PendingIntent.FLAG_IMMUTABLE);
+        android.app.Notification.Builder b = android.os.Build.VERSION.SDK_INT >= 26
+                ? new android.app.Notification.Builder(this, "vpn") : new android.app.Notification.Builder(this);
+        b.setSmallIcon(R.drawable.ic_vpn).setContentTitle("VPN")
+                .setContentText("Сервер: " + target(curConf.isEmpty() ? prefs.getString("conf", "") : curConf))
+                .setOngoing(true).setContentIntent(open);
+        try { nm.notify(1, b.build()); } catch (SecurityException ignored) { }
+        PhobosTile.refresh(this);
     }
 
     private void toggle() {
@@ -275,6 +384,20 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onActivityResult(int req, int res, Intent data) {
+        if (req == 9) {
+            if (res != RESULT_OK || data == null || data.getData() == null) return;
+            String name = "Phobos";
+            try (android.database.Cursor c = getContentResolver().query(data.getData(), null, null, null, null)) {
+                int i = c == null ? -1 : c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME);
+                if (i >= 0 && c.moveToFirst()) name = c.getString(i).replaceFirst("\\.[^.]*$", "");
+            } catch (Exception ignored) { }
+            try (java.io.InputStream in = getContentResolver().openInputStream(data.getData())) {
+                importText(new String(readAll(in), StandardCharsets.UTF_8), name);
+            } catch (Exception e) { toast("Не удалось прочитать файл: " + e.getMessage()); }
+            applyIfUp();
+            render();
+            return;
+        }
         if (req == 7 && res == RESULT_OK) bg.execute(this::up);
         else if (req == 7) toast("Без разрешения на VPN подключиться нельзя");
     }
@@ -289,13 +412,19 @@ public class MainActivity extends Activity {
             wsRelay = new WsRelay(TCP_LPORT, wsUrl(conf), this::log);
             wsRelay.start();
         }
+        String target = target(conf), host = target.replaceAll(":\\d+$", "").replaceAll("[\\[\\]]", "");
+        String override = viaTcp || viaWs ? "127.0.0.1:" + TCP_LPORT : null;
+        if (!viaTcp && !viaWs && host.contains(":")) {
+            v6Relay = new V6Relay(V6_LPORT, host, Integer.parseInt(target.replaceAll("^.*:", "")));
+            v6Relay.start();
+            override = "127.0.0.1:" + V6_LPORT;
+        }
         if (viaTcp) {
-            String host = target(conf).replaceAll(":\\d+$", "");
             relay = new ProcessBuilder(lib + "/libudptcp.so", "-c", "127.0.0.1:" + TCP_LPORT, host + ":" + tcpPort(conf))
                     .redirectErrorStream(true).redirectOutput(new File(getFilesDir(), "tcp.log")).start();
         }
         File cfg = new File(getFilesDir(), "obf.conf");
-        try (FileOutputStream o = new FileOutputStream(cfg)) { o.write(obfPart(conf, viaTcp || viaWs).getBytes(StandardCharsets.UTF_8)); }
+        try (FileOutputStream o = new FileOutputStream(cfg)) { o.write(obfPart(conf, override).getBytes(StandardCharsets.UTF_8)); }
         obfuscator = new ProcessBuilder(lib + "/libwgobfuscator.so", "-c", cfg.getAbsolutePath())
                 .redirectErrorStream(true).redirectOutput(new File(getFilesDir(), "obf.log")).start();
         Thread.sleep(600);
@@ -306,32 +435,74 @@ public class MainActivity extends Activity {
     }
 
     private void up() {
-        try {
-            String conf = prefs.getString("conf", "");
-            String mode = prefs.getString("transport", "auto");
-            boolean tcpAvail = !tcpPort(conf).isEmpty();
-            if ("tcp".equals(mode) && !tcpAvail) throw new IllegalStateException("на сервере нет TCP-канала — обновите панель и заново импортируйте ссылку");
-            startTransport(conf, "auto".equals(mode) ? "udp" : mode);
-            Config c = Config.parse(new BufferedReader(new StringReader(
-                    wgPart(conf, prefs.getString("mode", MODE_ALL), prefs.getString("apps", "")))));
-            backend.setState(TUNNEL, Tunnel.State.UP, c);
-            log("up ok, mode " + prefs.getString("mode", MODE_ALL) + ", transport " + mode);
-            post("Подключено (" + transport + ")");
-            if ("auto".equals(mode) && tcpAvail) watchUdp(conf);
-        } catch (Throwable e) {
-            stopObfuscator();
-            log("up failed: " + e);
-            post("Ошибка: " + e.getMessage());
+        synchronized (LOCK) {
+            try {
+                String base = prefs.getString("conf", "");
+                refreshSub(base);
+                subIndex = 0;
+                connect(sub.length() > 0 ? applying(base, sub.getJSONObject(0)) : base);
+                log("up ok, mode " + prefs.getString("mode", MODE_ALL) + ", servers " + Math.max(1, sub.length()));
+                notifyState(true);
+                post("Подключено (" + transport + ")");
+                if (sub.length() > 1 && !"cloud".equals(prefs.getString("transport", "auto"))) watchServer(base);
+            } catch (Throwable e) {
+                stopObfuscator();
+                log("up failed: " + e);
+                post("Ошибка: " + e.getMessage());
+            }
         }
+    }
+
+    /** Obfuscator (+ relay) and WireGuard for one server; called again in place on failover. */
+    private void connect(String conf) throws Exception {
+        String mode = prefs.getString("transport", "auto");
+        boolean tcpAvail = !tcpPort(conf).isEmpty();
+        if ("tcp".equals(mode) && !tcpAvail && sub.length() == 0) throw new IllegalStateException("на сервере нет TCP-канала — обновите панель и заново импортируйте ссылку");
+        startTransport(conf, "tcp".equals(mode) && !tcpAvail ? "udp" : "auto".equals(mode) ? "udp" : mode);
+        Config c = Config.parse(new BufferedReader(new StringReader(
+                wgPart(conf, prefs.getString("mode", MODE_ALL), prefs.getString("apps", ""), true))));
+        backend.setState(TUNNEL, Tunnel.State.UP, c);
+        curConf = conf;
+        if ("auto".equals(mode) && tcpAvail) watchUdp(conf);
+    }
+
+    /** Server answered nothing for SILENCE_MS -> next subscription server. Runs while the VPN service keeps the process alive. */
+    private void watchServer(String base) {
+        final long gen = ++watchGen;
+        new Thread(() -> {
+            long lastRx = -1, since = System.currentTimeMillis();
+            while (gen == watchGen) {
+                try { Thread.sleep(5000); } catch (InterruptedException e) { return; }
+                if (gen != watchGen || !isUp()) return;
+                long rx;
+                try { rx = backend.getStatistics(TUNNEL).totalRx(); } catch (Exception e) { continue; }
+                long now = System.currentTimeMillis();
+                if (rx != lastRx) { lastRx = rx; since = now; continue; }
+                if (now - since < SILENCE_MS) continue;
+                since = now;
+                synchronized (LOCK) {
+                    if (gen != watchGen) return;
+                    try {
+                        subIndex = (subIndex + 1) % sub.length();
+                        org.json.JSONObject s = sub.getJSONObject(subIndex);
+                        log("server silent -> " + s.optString("host") + ":" + s.optInt("port"));
+                        connect(applying(base, s));
+                        notifyState(true);
+                        post("Сервер не отвечал — перешёл на " + target(curConf));
+                    } catch (Throwable e) { log("failover: " + e); }
+                }
+            }
+        }, "phobos-watch").start();
     }
 
     /** Auto: no bytes back over UDP within 15 s -> UDP is cut, move the obfuscator to TCP. */
     private void watchUdp(String conf) {
         new Thread(() -> {
             try {
+                long rx0 = backend.getStatistics(TUNNEL).totalRx();
                 Thread.sleep(15000);
-                if (!isUp() || !"UDP".equals(transport)) return;
-                if (backend.getStatistics(TUNNEL).totalRx() > 0) return;
+                if (!isUp() || !"UDP".equals(transport) || !conf.equals(curConf)) return;
+                if (backend.getStatistics(TUNNEL).totalRx() > rx0) return;
                 log("UDP: no answer in 15 s -> switching to TCP");
                 startTransport(conf, "tcp");
                 post("UDP не отвечает — переключился на TCP");
@@ -340,9 +511,12 @@ public class MainActivity extends Activity {
     }
 
     private void down() {
+        watchGen++;
+        curConf = "";
         try { backend.setState(TUNNEL, Tunnel.State.DOWN, null); } catch (Throwable ignored) { }
         stopObfuscator();
         transport = "";
+        notifyState(false);
         post("Отключено");
     }
 
@@ -350,6 +524,7 @@ public class MainActivity extends Activity {
         if (obfuscator != null) { obfuscator.destroy(); obfuscator = null; }
         if (relay != null) { relay.destroy(); relay = null; }
         if (wsRelay != null) { wsRelay.stop(); wsRelay = null; }
+        if (v6Relay != null) { v6Relay.stop(); v6Relay = null; }
     }
 
     private void post(String msg) { ui.post(() -> { toast(msg); refresh(); }); }
@@ -383,7 +558,8 @@ public class MainActivity extends Activity {
                     + "на этом устройстве, или скопируйте её и нажмите «Импорт».", muted(), 14, false));
         } else {
             prof.addView(tv(prefs.getString("name", "Phobos"), text(), 18, true));
-            prof.addView(tv("Сервер: " + target(conf), muted(), 14, false));
+            server = tv("", muted(), 14, false);
+            prof.addView(server);
         }
         box.addView(prof, mw(0));
 
@@ -448,13 +624,18 @@ public class MainActivity extends Activity {
             tg.addView(r);
         }
         split.addView(tg);
+        int ns = lines(prefs.getString("my_direct", "")).size() + lines(prefs.getString("my_vpn", "")).size();
+        split.addView(button("Свои сайты (" + ns + ")", 0xFF475569, v -> sitesDialog()), mw(4));
         int n = prefs.getString("apps", "").isEmpty() ? 0 : prefs.getString("apps", "").split(",").length;
         split.addView(button("Выбрать приложения (" + n + ")", 0xFF475569, v -> pickApps()), mw(8));
+        split.addView(button("Свой DNS" + (myDns().isEmpty() ? "" : " (" + myDns() + ")"), 0xFF475569, v -> dnsDialog()), mw(8));
         split.addView(tv("Изменения применяются сразу. Само приложение всегда идёт напрямую — так обфускатор держит связь с сервером.",
                 muted(), 12, false), mw(6));
         box.addView(split, mw(20));
 
         box.addView(button("Импорт ссылки phobos://", 0xFF4F46E5, v -> importDialog()), mw(16));
+        box.addView(button("Импорт из файла .conf", 0xFF4F46E5, v -> startActivityForResult(
+                new Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"), 9)), mw(8));
         box.addView(button("Проверить скорость", 0xFF0EA5E9, v -> speedtest()), mw(8));
         box.addView(button("Журнал", 0xFF475569, v -> showLog()), mw(8));
         root.addView(sv, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1));
@@ -468,6 +649,8 @@ public class MainActivity extends Activity {
         if (power == null) return;
         boolean up = isUp();
         power.setText(up ? "Отключить" : "Подключить");
+        String conf = prefs.getString("conf", "");
+        if (server != null && !conf.isEmpty()) server.setText("Сервер: " + target(up && !curConf.isEmpty() ? curConf : conf));
         power.setBackground(round(up ? 0xFF16A34A : 0xFF4F46E5, 90));
         status.setText(up ? "🟢 VPN включён" + (transport.isEmpty() ? "" : " · " + transport) : "⚪ VPN выключен");
         if (up) {
@@ -500,6 +683,22 @@ public class MainActivity extends Activity {
                 .setNegativeButton("Отмена", null).show();
     }
 
+    private void dnsDialog() {
+        final EditText e = new EditText(this);
+        e.setHint("1.1.1.1, 8.8.8.8");
+        e.setText(myDns());
+        new AlertDialog.Builder(this).setTitle("Свой DNS").setView(e)
+                .setMessage("Адреса DNS-серверов через запятую. Пусто — DNS из профиля.")
+                .setPositiveButton("Сохранить", (d, w) -> {
+                    String v = String.join(", ", lines(e.getText().toString()));
+                    if (!v.isEmpty() && !v.matches("[0-9a-fA-F:., ]+")) { toast("DNS — только IP-адреса, например 1.1.1.1"); return; }
+                    prefs.edit().putString("dns", v).apply();
+                    applyIfUp();
+                    render();
+                })
+                .setNegativeButton("Отмена", null).show();
+    }
+
     /** Channel "Облако": address of the user's Keenetic web app (KeenDNS cloud) with wsgw behind it. */
     private void wsDialog() {
         final EditText e = new EditText(this);
@@ -512,6 +711,36 @@ public class MainActivity extends Activity {
                     if (!u.isEmpty() && !u.startsWith("wss://")) u = "wss://" + u.replaceFirst("^\\w+://", "");
                     prefs.edit().putString("ws_url", u).apply();
                     applyIfUp();
+                })
+                .setNegativeButton("Отмена", null).show();
+    }
+
+    /** User's own exceptions to "Russian sites directly": domains, IPs or networks, one per line. */
+    private void sitesDialog() {
+        LinearLayout l = new LinearLayout(this);
+        l.setOrientation(LinearLayout.VERTICAL);
+        l.setPadding(dp(16), dp(8), dp(16), 0);
+        l.addView(tv("Напрямую, без VPN (по одному на строку):", text(), 14, true));
+        final EditText direct = new EditText(this);
+        direct.setHint("mysite.ru\n1.2.3.4\n5.6.0.0/16");
+        direct.setText(prefs.getString("my_direct", ""));
+        direct.setMinLines(3);
+        l.addView(direct);
+        l.addView(tv("Всегда через VPN, даже если российский:", text(), 14, true), mw(8));
+        final EditText vpn = new EditText(this);
+        vpn.setHint("rutracker.org");
+        vpn.setText(prefs.getString("my_vpn", ""));
+        vpn.setMinLines(3);
+        l.addView(vpn);
+        l.addView(tv("Работает, когда включено «Российские сайты — напрямую». Сайт берётся по его текущим адресам при подключении.", muted(), 12, false), mw(6));
+        ScrollView sv = new ScrollView(this);
+        sv.addView(l);
+        new AlertDialog.Builder(this).setTitle("Свои сайты").setView(sv)
+                .setPositiveButton("Сохранить", (d, w) -> {
+                    prefs.edit().putString("my_direct", direct.getText().toString().trim())
+                            .putString("my_vpn", vpn.getText().toString().trim()).apply();
+                    applyIfUp();
+                    render();
                 })
                 .setNegativeButton("Отмена", null).show();
     }

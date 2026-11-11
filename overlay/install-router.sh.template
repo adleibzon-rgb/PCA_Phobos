@@ -417,6 +417,16 @@ show_final_info() {
 }
 
 
+# Убирает из crontab строки health/pull только этой учётки ($1 = "PHOBOS_ACC=<dir> "
+# для доп. учётки, "PHOBOS_ACC=" для главной — у неё строки без PHOBOS_ACC).
+drop_own_cron() {
+  if [ "$1" = "PHOBOS_ACC=" ]; then
+    awk '!/phobos-(health|pull)/ || /PHOBOS_ACC=/'
+  else
+    grep -v -F "$1"
+  fi
+}
+
 deploy_health_monitor() {
   log "Развертывание монитора здоровья Phobos..."
 
@@ -428,12 +438,19 @@ deploy_health_monitor() {
   cp "phobos-health.sh" "$PHOBOS_DIR/phobos-health.sh"
   chmod +x "$PHOBOS_DIR/phobos-health.sh"
 
-  if [ -f "failover.conf" ]; then
-    cp "failover.conf" "$PHOBOS_DIR/failover.conf"
-    chmod 600 "$PHOBOS_DIR/failover.conf"
+  # 02.11.2026: вторая и следующие учётки на одном роутере — свой каталог
+  # (failover.conf, state, client_id, panel_*), свои строки cron с PHOBOS_ACC.
+  local A="$PHOBOS_DIR" envp="" mine="PHOBOS_ACC="
+  local main_cid=$(cat "$A/client_id" 2>/dev/null)
+  if [ -n "$main_cid" ] && [ "$main_cid" != "{{CLIENT_NAME}}" ]; then
+    A="$PHOBOS_DIR/acc/{{CLIENT_NAME}}"; envp="PHOBOS_ACC=$A "; mine="PHOBOS_ACC=$A "
+    log "  Дополнительная учётка: $A (главная — $main_cid)"
   fi
-
-  mkdir -p "$PHOBOS_DIR/state"
+  mkdir -p "$A/state"
+  if [ -f "failover.conf" ]; then
+    cp "failover.conf" "$A/failover.conf"
+    chmod 600 "$A/failover.conf"
+  fi
 
   # --- Phobos pull agent: panel -> router config sync (NAT-friendly) ---
   # Routers behind NAT cannot be reached by the panel over SSH, so they PULL
@@ -441,18 +458,18 @@ deploy_health_monitor() {
   if [ -f "phobos-pull.sh" ]; then
     cp "phobos-pull.sh" "$PHOBOS_DIR/phobos-pull.sh"
     chmod +x "$PHOBOS_DIR/phobos-pull.sh"
-    echo "{{CLIENT_NAME}}" > "$PHOBOS_DIR/client_id"
-    [ -f "pull_token" ] && cp "pull_token" "$PHOBOS_DIR/pull_token"
-    [ -f "panel_tunnel_ip" ] && cp "panel_tunnel_ip" "$PHOBOS_DIR/panel_tunnel_ip"
-    [ -f "panel_port" ] && cp "panel_port" "$PHOBOS_DIR/panel_port"
-    [ -f "panel_scheme" ] && cp "panel_scheme" "$PHOBOS_DIR/panel_scheme"
-    [ -f "panel_url" ] && cp "panel_url" "$PHOBOS_DIR/panel_url"
-    [ -f "panel_urls" ] && cp "panel_urls" "$PHOBOS_DIR/panel_urls"
+    echo "{{CLIENT_NAME}}" > "$A/client_id"
+    [ -f "pull_token" ] && cp "pull_token" "$A/pull_token"
+    [ -f "panel_tunnel_ip" ] && cp "panel_tunnel_ip" "$A/panel_tunnel_ip"
+    [ -f "panel_port" ] && cp "panel_port" "$A/panel_port"
+    [ -f "panel_scheme" ] && cp "panel_scheme" "$A/panel_scheme"
+    [ -f "panel_url" ] && cp "panel_url" "$A/panel_url"
+    [ -f "panel_urls" ] && cp "panel_urls" "$A/panel_urls"
     log "  Pull-агент установлен (client_id={{CLIENT_NAME}})"
   fi
 
-  local cron_line="*/1 * * * * $PHOBOS_DIR/phobos-health.sh"
-  local pull_line="*/1 * * * * $PHOBOS_DIR/phobos-pull.sh"
+  local cron_line="*/1 * * * * ${envp}$PHOBOS_DIR/phobos-health.sh"
+  local pull_line="*/1 * * * * ${envp}$PHOBOS_DIR/phobos-pull.sh"
   [ -f "$PHOBOS_DIR/phobos-pull.sh" ] || pull_line=""
 
   if [ "$ROUTER_PLATFORM" = "keenetic" ]; then
@@ -468,21 +485,21 @@ deploy_health_monitor() {
     mkdir -p /opt/var/spool/cron/crontabs
     # 01.11.2026: демоны cron на Keenetic (busybox crond, Entware cron) читают crontab
     # пользователя root, а не /opt/etc/crontab — туда писать бесполезно
-    sed -i "/phobos-health\|phobos-pull/d" /opt/etc/crontab 2>/dev/null || true
-    (crontab -l 2>/dev/null | grep -v "phobos-health" | grep -v "phobos-pull"; echo "$cron_line"; [ -n "$pull_line" ] && echo "$pull_line") | crontab -
+    [ -z "$envp" ] && sed -i "/phobos-health\|phobos-pull/d" /opt/etc/crontab 2>/dev/null || true
+    (crontab -l 2>/dev/null | drop_own_cron "$mine"; echo "$cron_line"; [ -n "$pull_line" ] && echo "$pull_line") | crontab -
     log "  Cron добавлен через crontab (health + pull)"
     /opt/etc/init.d/S10cron restart >/dev/null 2>&1 || true
   elif [ "$ROUTER_PLATFORM" = "openwrt" ]; then
-    (crontab -l 2>/dev/null | grep -v "phobos-health" | grep -v "phobos-pull"; echo "$cron_line"; [ -n "$pull_line" ] && echo "$pull_line") | crontab -
+    (crontab -l 2>/dev/null | drop_own_cron "$mine"; echo "$cron_line"; [ -n "$pull_line" ] && echo "$pull_line") | crontab -
     log "  Cron добавлен через crontab (health + pull)"
   elif [ "$ROUTER_PLATFORM" = "linux" ]; then
-    { echo "$cron_line"; [ -n "$pull_line" ] && echo "$pull_line"; } > /etc/cron.d/phobos-health
-    chmod 644 /etc/cron.d/phobos-health
+    { echo "$cron_line"; [ -n "$pull_line" ] && echo "$pull_line"; } > /etc/cron.d/phobos-health${envp:+-{{CLIENT_NAME}}}
+    chmod 644 /etc/cron.d/phobos-health*
     log "  Cron добавлен в /etc/cron.d/phobos-health (health + pull)"
   fi
 
   log "  Монитор здоровья: $PHOBOS_DIR/phobos-health.sh"
-  log "  Failover конфиг: $PHOBOS_DIR/failover.conf"
+  log "  Failover конфиг: $A/failover.conf"
   log "  Проверка каждую минуту через cron"
 }
 

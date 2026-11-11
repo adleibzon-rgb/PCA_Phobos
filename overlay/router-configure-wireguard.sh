@@ -278,11 +278,21 @@ EOF
 
     # Настраиваем статический маршрут в созданный интерфейс отдельным вызовом RCI
     local route_target_net=$(echo "$client_ip_addr" | cut -d'.' -f1-2).0.0
-    log "Настройка маршрута для подсети туннеля (${route_target_net}/16) -> ${interface_name}..."
+    local route_mask="255.255.0.0"
+    # 02.11.2026: доп. учётка (на роутере уже стоит другая): та же /16 через второй
+    # интерфейс конфликтует с главной, а /32 до панели увёл бы pull главной в чужой
+    # туннель — маршрут не ставим, pull доп. учётки ходит по panel_urls.
+    local main_cid=$(cat /opt/etc/Phobos/client_id 2>/dev/null)
+    if [ -n "$main_cid" ] && [ "$main_cid" != "${CLIENT_NAME}" ]; then
+        log "Доп. учётка (главная — ${main_cid}): маршрут подсети туннеля не нужен"
+        log "Интерфейс ${interface_name} создан ✓"
+        return 0
+    fi
+    log "Настройка маршрута для туннеля (${route_target_net}/${route_mask}) -> ${interface_name}..."
     local route_json=$(cat <<EOF
 {
   "network": "${route_target_net}",
-  "mask": "255.255.0.0",
+  "mask": "${route_mask}",
   "interface": "${interface_name}",
   "auto": true
 }

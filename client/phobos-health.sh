@@ -6,11 +6,19 @@
 # ============================================================
 
 PHOBOS_DIR="/opt/etc/Phobos"
-CONF="$PHOBOS_DIR/failover.conf"
-STATE="$PHOBOS_DIR/state"
-LOG="$PHOBOS_DIR/health.log"
+# 02.11.2026: несколько учёток на одном роутере. Файлы учётки (failover.conf, state,
+# client_id, panel_*) — в PHOBOS_ACC (доп. учётки: $PHOBOS_DIR/acc/<клиент>),
+# главная — прямо в $PHOBOS_DIR. Конфиги обфускаторов общие, свой ищем по *.link.
+ACC_DIR="${PHOBOS_ACC:-$PHOBOS_DIR}"
+CONF="$ACC_DIR/failover.conf"
+STATE="$ACC_DIR/state"
+LOG="$ACC_DIR/health.log"
+CID=$(cat "$ACC_DIR/client_id" 2>/dev/null)
 OBF_CONF="$PHOBOS_DIR/wg-obfuscator.conf"
-LOCKFILE="/tmp/phobos-health.lock"
+for l in "$PHOBOS_DIR"/wg-obfuscator*.link; do
+    [ -n "$CID" ] && [ "$(cat "$l" 2>/dev/null)" = "$CID" ] && OBF_CONF="${l%.link}.conf" && break
+done
+LOCKFILE="/tmp/phobos-health${PHOBOS_ACC:+-$CID}.lock"
 WG_IF="Wireguard3"
 
 MAX_LOG_LINES=200
@@ -25,9 +33,9 @@ PRIMARY_CHECK_INTERVAL=300
 # wg-obfuscator-* services are active — the bare panel port stays up even
 # when the tunnel path is dead, so we must NOT switch back on panel liveness
 # alone (that caused premature switchback to a dead primary).
-PRIMARY_PROBE_SCHEME="${PRIMARY_PROBE_SCHEME:-$(cat "$PHOBOS_DIR/panel_scheme" 2>/dev/null)}"
+PRIMARY_PROBE_SCHEME="${PRIMARY_PROBE_SCHEME:-$(cat "$ACC_DIR/panel_scheme" 2>/dev/null)}"
 PRIMARY_PROBE_SCHEME="${PRIMARY_PROBE_SCHEME:-http}"
-PRIMARY_PROBE_PORT="${PRIMARY_PROBE_PORT:-$(cat "$PHOBOS_DIR/panel_port" 2>/dev/null)}"
+PRIMARY_PROBE_PORT="${PRIMARY_PROBE_PORT:-$(cat "$ACC_DIR/panel_port" 2>/dev/null)}"
 PRIMARY_PROBE_PORT="${PRIMARY_PROBE_PORT:-8443}"
 PRIMARY_PROBE_PATH="/api/obf-health"
 # Connectivity check targets (logged for context only)
@@ -55,6 +63,16 @@ mkdir -p "$STATE"
 
 # ── Detect WG interface ──
 detect_wg_interface() {
+    # точное совпадение "Phobos-<клиент>"; доп. учётка не должна схватить чужой интерфейс
+    for i in 0 1 2 3 4 5 6 7 8 9; do
+        desc=$(ndmc -c "show interface Wireguard${i}" 2>/dev/null | grep description | head -1)
+        # HydraRoute Neo names the interface by the bare client id (09.33)
+        if [ -n "$CID" ] && echo "$desc" | grep -qE "(Phobos-|: )${CID}\$"; then
+            WG_IF="Wireguard${i}"
+            return 0
+        fi
+    done
+    [ -n "$PHOBOS_ACC" ] && return 1
     for i in 0 1 2 3 4 5 6 7 8 9; do
         desc=$(ndmc -c "show interface Wireguard${i}" 2>/dev/null | grep description | head -1)
         if echo "$desc" | grep -qi phobos; then
@@ -63,6 +81,19 @@ detect_wg_interface() {
         fi
     done
     return 1
+}
+
+# ── Restart own obfuscator (init script whose ARGS name our config) ──
+restart_obf() {
+    sc=$(grep -l "/$(basename "$OBF_CONF")\"\$" /opt/etc/init.d/S*obfuscator* 2>/dev/null | head -1)
+    [ -z "$sc" ] && [ -f /opt/etc/init.d/S49wg-obfuscator ] && sc=/opt/etc/init.d/S49wg-obfuscator
+    if [ -n "$sc" ]; then
+        "$sc" restart >/dev/null 2>&1
+    else
+        killall wg-obfuscator 2>/dev/null
+        sleep 1
+        wg-obfuscator --config "$OBF_CONF" &
+    fi
 }
 
 # ── Read failover config ──
@@ -80,6 +111,7 @@ while true; do
     eval "SERVER_${idx}_PORTS=$(echo "$val" | cut -d: -f2-)"
     eval "SERVER_${idx}_KEY=$(grep "^KEY_${idx}=" "$CONF" 2>/dev/null | cut -d= -f2-)"
     eval "SERVER_${idx}_WGKEY=$(grep "^WGKEY_${idx}=" "$CONF" 2>/dev/null | cut -d= -f2-)"
+    eval "SERVER_${idx}_TCP=$(grep "^TCP_${idx}=" "$CONF" 2>/dev/null | cut -d= -f2-)"
     SERVER_COUNT=$idx
     idx=$((idx + 1))
 done
@@ -94,13 +126,25 @@ CURRENT_SERVER=$(cat "$STATE/current_server" 2>/dev/null || echo "1")
 CURRENT_PORT_IDX=$(cat "$STATE/current_port_idx" 2>/dev/null || echo "0")
 FAIL_COUNT=$(cat "$STATE/fail_count" 2>/dev/null || echo "0")
 PRIMARY_CHECK_TS=$(cat "$STATE/primary_check_ts" 2>/dev/null || echo "0")
+TCP_MODE=$(cat "$STATE/tcp_mode" 2>/dev/null || echo "0")       # 0 = UDP, N = TCP via server N
+CYCLES=$(cat "$STATE/udp_cycles" 2>/dev/null || echo "0")       # full UDP rounds without success
+UDPTCP_BIN=/opt/bin/udptcp
+UDPTCP_LPORT=13256
 
-# ── Detect Phobos WG interface (non-fatal, fallback to Wireguard3) ──
-# Нет своего интерфейса — выходим: запасной Wireguard3 бывает чужим туннелем.
+# ── Detect Phobos WG interface ──
+# Нет своего интерфейса — выходим: запасной Wireguard3 бывает чужим (так сторож
+# удалённой доп. учётки вписал пир Phobos в посторонний туннель).
 detect_wg_interface || {
     log "ERROR: own WG interface not found, skip"
     exit 0
 }
+
+# ── Panel tunnel IP must go through our tunnel (HydraRoute-made interface has no
+#    such route → pull went to WAN and hung, 09.33) ──
+PT_IP=$(cat "$ACC_DIR/panel_tunnel_ip" 2>/dev/null)
+if [ -n "$PT_IP" ] && ip route get "$PT_IP" 2>/dev/null | grep -q "dev ppp\|dev eth\|dev wan"; then
+    ndmc -c "ip route $PT_IP 255.255.255.255 $WG_IF auto" >/dev/null 2>&1 && log "ROUTE: $PT_IP via $WG_IF"
+fi
 
 # ── Get handshake age via ndmc ──
 # A peer switch can leave the removed peer's stale handshake listed in ndmc
@@ -151,9 +195,13 @@ list_iface_keys() {
 count_server_peers() {
     present=$(list_iface_keys)
     n=0
+    seen=" "
     i=1
     while [ "$i" -le "$SERVER_COUNT" ]; do
         eval "wk=\$SERVER_${i}_WGKEY"
+        # one server may have several addresses = same key in several entries
+        case "$seen" in *" $wk "*) i=$((i + 1)); continue ;; esac
+        seen="$seen$wk "
         if [ -n "$wk" ] && echo "$present" | grep -q "^${wk}$"; then
             n=$((n + 1))
         fi
@@ -194,7 +242,7 @@ switch_wg_peer() {
         # 01.11.2026: порт — из конфига обфускатора (было зашито 13255, а установщик
         # берёт свободный, на части роутеров 51820 → после переключения туннель мёртв).
         # Через ndmc по шагам: JSON-RCI с allow-ips "::"/0 молча не ставил allow-ips.
-        lport=$(grep 'source-lport' "$PHOBOS_DIR/wg-obfuscator.conf" 2>/dev/null | tr -d ' ' | cut -d'=' -f2)
+        lport=$(grep 'source-lport' "$OBF_CONF" 2>/dev/null | tr -d ' ' | cut -d'=' -f2)
         lport=${lport:-13255}
         ndmc -c "interface $WG_IF wireguard peer $new_key" >/dev/null 2>&1
         ndmc -c "interface $WG_IF wireguard peer $new_key endpoint 127.0.0.1:$lport" >/dev/null 2>&1
@@ -226,6 +274,7 @@ switch_endpoint() {
     fi
 
     log "SWITCH → server $server_idx ($host:$port)"
+    stop_tcp
 
     # 1. Switch WG peer key if different server
     switch_wg_peer "$wg_key"
@@ -239,18 +288,51 @@ switch_endpoint() {
     fi
 
     # 3. Restart obfuscator
-    if [ -f /opt/etc/init.d/S49wg-obfuscator ]; then
-        /opt/etc/init.d/S49wg-obfuscator restart >/dev/null 2>&1
-    else
-        killall wg-obfuscator 2>/dev/null
-        sleep 1
-        wg-obfuscator --config "$OBF_CONF" &
-    fi
+    restart_obf
 
     # 4. Save state (fail_count is managed by the caller, NOT reset here —
     #    resetting on a port-hop would prevent escalation to server failover)
     echo "$server_idx" > "$STATE/current_server"
     echo "$port_idx" > "$STATE/current_port_idx"
+}
+
+# ── TCP channel (09.33/1.5.0): obfuscated UDP inside TCP via local udptcp ──
+stop_tcp() {
+    [ "$TCP_MODE" = "0" ] && ! pidof udptcp >/dev/null 2>&1 && return 0
+    killall udptcp 2>/dev/null
+    TCP_MODE=0
+    echo 0 > "$STATE/tcp_mode"
+}
+
+# start_tcp N — tunnel through server N's TCP port; 1 = started
+start_tcp() {
+    n=$1
+    eval "host=\$SERVER_${n}_HOST"
+    eval "tport=\$SERVER_${n}_TCP"
+    eval "obf_key=\$SERVER_${n}_KEY"
+    eval "wg_key=\$SERVER_${n}_WGKEY"
+    [ -n "$tport" ] && [ -x "$UDPTCP_BIN" ] || return 1
+    killall udptcp 2>/dev/null
+    "$UDPTCP_BIN" -c "127.0.0.1:${UDPTCP_LPORT}" "${host}:${tport}" >/dev/null 2>&1 &
+    switch_wg_peer "$wg_key"
+    sed -i "s|^target = .*|target = 127.0.0.1:${UDPTCP_LPORT}|" "$OBF_CONF"
+    [ -n "$obf_key" ] && sed -i "s|^key = .*|key = ${obf_key}|" "$OBF_CONF"
+    restart_obf
+    TCP_MODE=$n
+    echo "$n" > "$STATE/tcp_mode"
+    echo "$n" > "$STATE/current_server"
+    log "TCP MODE → server $n (${host}:${tport} over TCP)"
+    return 0
+}
+
+# try_tcp_after N — first server after N (no wrap) that has a TCP port; 1 = none
+try_tcp_after() {
+    i=$(( $1 + 1 ))
+    while [ "$i" -le "$SERVER_COUNT" ]; do
+        start_tcp "$i" && return 0
+        i=$((i + 1))
+    done
+    return 1
 }
 
 # ── Try next port on current server ──
@@ -267,7 +349,9 @@ try_next_port() {
 # ── Try next server ──
 try_next_server() {
     next=$((CURRENT_SERVER + 1))
-    [ "$next" -gt "$SERVER_COUNT" ] && next=1
+    if [ "$next" -gt "$SERVER_COUNT" ]; then
+        next=1
+    fi
     [ "$next" -eq "$CURRENT_SERVER" ] && return 1
 
     log "FAILOVER → server $next"
@@ -277,7 +361,7 @@ try_next_server() {
 
 # ── Check if primary is back ──
 check_primary() {
-    [ "$CURRENT_SERVER" -eq 1 ] && return
+    [ "$CURRENT_SERVER" -eq 1 ] && [ "$TCP_MODE" = "0" ] && return
 
     now=$(date +%s)
     elapsed=$((now - PRIMARY_CHECK_TS))
@@ -299,7 +383,10 @@ check_primary() {
         fi
     done
     if [ -n "$ok_url" ]; then
-        log "PRIMARY ($ok_url http=200) alive, switching back"
+        # HTTP alive does not mean UDP passes (провайдер режет UDP к IP, 09.33):
+        # пробуем, а если рукопожатия не будет — trial_check вернёт как было.
+        log "PRIMARY ($ok_url http=200) alive, TRIAL switch back"
+        echo "$CURRENT_SERVER $CURRENT_PORT_IDX $TCP_MODE $(date +%s)" > "$STATE/trial"
         switch_endpoint 1 0
         echo "0" > "$STATE/fail_count"
     else
@@ -341,6 +428,8 @@ heal_lan_routing() {
     while read -r mac pol; do
         [ -z "$mac" ] && continue
         case "$mac" in \#*) continue;; esac
+        # политику удалили — не воскрешаем привязку к ней
+        echo "$rc" | grep -qx "ip policy $pol" || continue
         if ! echo "$rc" | grep -q "host $mac policy $pol"; then
             ndmc -c "ip hotspot host $mac policy $pol" >/dev/null 2>&1
             log "HEAL: re-bound host $mac -> $pol"
@@ -417,12 +506,31 @@ fi
 AGE=$(get_handshake_age)
 WAN=$(check_connectivity && echo "yes" || echo "no")
 
+# ── Trial of the primary: fresh handshake within ~2 min or go back ──
+if [ -f "$STATE/trial" ]; then
+    read t_srv t_port t_tcp t_ts < "$STATE/trial"
+    if [ "$AGE" -lt "$HANDSHAKE_WARN" ]; then
+        log "TRIAL ok: primary works"
+        rm -f "$STATE/trial"; echo 0 > "$STATE/udp_cycles"
+    elif [ $(( $(date +%s) - ${t_ts:-0} )) -ge 110 ]; then
+        rm -f "$STATE/trial"
+        log "TRIAL failed: back to server $t_srv"
+        if [ "${t_tcp:-0}" != "0" ]; then start_tcp "$t_tcp" || switch_endpoint "$t_srv" "$t_port"
+        else switch_endpoint "$t_srv" "$t_port"; fi
+        echo 0 > "$STATE/fail_count"
+        exit 0
+    else
+        exit 0   # give the trial time
+    fi
+fi
+
 # Tunnel healthy = fresh handshake
 if [ "$AGE" -lt "$HANDSHAKE_WARN" ]; then
     if [ "$FAIL_COUNT" -gt 0 ]; then
         log "OK: tunnel up (handshake=${AGE}s, server=$CURRENT_SERVER, wan=$WAN)"
         echo "0" > "$STATE/fail_count"
     fi
+    echo 0 > "$STATE/udp_cycles"
     check_primary
     exit 0
 fi
@@ -438,23 +546,30 @@ log "STALE: handshake=${AGE}s wan=${WAN} server=$CURRENT_SERVER port=$CURRENT_PO
 # Stage 1 (fail 1): Restart obfuscator
 if [ "$FAIL_COUNT" -eq 1 ]; then
     log "ACTION: restart obfuscator"
-    if [ -f /opt/etc/init.d/S49wg-obfuscator ]; then
-        /opt/etc/init.d/S49wg-obfuscator restart >/dev/null 2>&1
-    else
-        killall wg-obfuscator 2>/dev/null
-        sleep 1
-        wg-obfuscator --config "$OBF_CONF" &
-    fi
+    restart_obf
     exit 0
 fi
 
-# Stage 2 (fail 2): Port hop to an alternate port on the SAME server
-if [ "$FAIL_COUNT" -eq 2 ]; then
+# TCP mode went stale → back to the UDP round (next server)
+if [ "$TCP_MODE" != "0" ] && [ "$FAIL_COUNT" -ge 2 ]; then
+    log "TCP stale on server $TCP_MODE"
+    if try_tcp_after "$TCP_MODE"; then echo 0 > "$STATE/fail_count"; exit 0; fi
+    stop_tcp
+    switch_endpoint 1 0; echo 0 > "$STATE/fail_count"; exit 0
+fi
+
+# Stage 2 (fail 2+): hop through ALL ports of the SAME server (was: only one)
+if [ "$FAIL_COUNT" -ge 2 ]; then
     if try_next_port; then
         exit 0
     fi
-    # only one port → fall through to server failover
-    log "single port, escalate to failover"
+    log "ports of server $CURRENT_SERVER exhausted, escalate to failover"
+fi
+
+# Whole UDP round failed (all servers × ports) → TCP, if any server offers it
+if [ "$CURRENT_SERVER" -eq "$SERVER_COUNT" ]; then
+    CYCLES=$((CYCLES + 1)); echo "$CYCLES" > "$STATE/udp_cycles"
+    if try_tcp_after 0; then echo 0 > "$STATE/fail_count"; exit 0; fi
 fi
 
 # Stage 3 (fail 3+): Server failover. Reset fail_count so the new server

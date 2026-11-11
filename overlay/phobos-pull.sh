@@ -1,4 +1,5 @@
 #!/bin/sh
+export PATH=/opt/bin:/opt/sbin:/opt/usr/bin:$PATH  # cron без /opt/bin -> busybox wget висел вечно (09.29)
 # ============================================================
 #  Phobos Config Pull — NAT-friendly management channel.
 #  Runs ON the router via cron (every 2 min). OUTBOUND ONLY:
@@ -21,9 +22,11 @@
 #    PANEL env or default below    -> panel base URL
 # ============================================================
 PHOBOS_DIR="/opt/etc/Phobos"
-CONF="$PHOBOS_DIR/failover.conf"
+# 02.11.2026: доп. учётки — PHOBOS_ACC=$PHOBOS_DIR/acc/<клиент> (см. phobos-health.sh)
+ACC_DIR="${PHOBOS_ACC:-$PHOBOS_DIR}"
+CONF="$ACC_DIR/failover.conf"
 HEALTH="$PHOBOS_DIR/phobos-health.sh"
-LOG="$PHOBOS_DIR/health.log"
+LOG="$ACC_DIR/health.log"
 # Config sources, tried in order. TUNNEL FIRST: panel_tunnel_ip is the wg0 of
 # whatever server the tunnel currently terminates on, so management rides the
 # same obfuscated channel as data — survives a public-IP ban and follows
@@ -31,15 +34,18 @@ LOG="$PHOBOS_DIR/health.log"
 #   - panel_tunnel_ip:8444   -> secondary server agent (phobos-api)
 #   - panel_tunnel_ip:<panel_port> -> primary server panel
 #   - public panel IP  -> bootstrap / if tunnel is down
-PANEL_TUNNEL_IP="${PANEL_TUNNEL_IP:-$(cat "$PHOBOS_DIR/panel_tunnel_ip" 2>/dev/null)}"
+PANEL_TUNNEL_IP="${PANEL_TUNNEL_IP:-$(cat "$ACC_DIR/panel_tunnel_ip" 2>/dev/null)}"
 [ -n "$PANEL_TUNNEL_IP" ] || PANEL_TUNNEL_IP="10.25.0.1"
-PANEL="${PANEL:-$(cat "$PHOBOS_DIR/panel_url" 2>/dev/null)}"
-PANEL_URLS="${PANEL_URLS:-$(cat "$PHOBOS_DIR/panel_urls" 2>/dev/null)}"
+PANEL="${PANEL:-$(cat "$ACC_DIR/panel_url" 2>/dev/null)}"
+PANEL_URLS="${PANEL_URLS:-$(cat "$ACC_DIR/panel_urls" 2>/dev/null)}"
 [ -n "$PANEL_URLS" ] || PANEL_URLS="http://${PANEL_TUNNEL_IP}:8444 $PANEL"
-CLIENT_ID=$(cat "$PHOBOS_DIR/client_id" 2>/dev/null || echo "home")
-TOKEN=$(cat "$PHOBOS_DIR/pull_token" 2>/dev/null)
-TMP="/tmp/failover.conf.pull"
-LOCK="/tmp/phobos-pull.lock"
+# + public URLs the panel announced in failover.conf (second IP etc., 09.33)
+_extra=$(grep "^PANEL_URLS_EXTRA=" "$CONF" 2>/dev/null | cut -d= -f2-)
+for _u in $_extra; do case " $PANEL_URLS " in *" $_u "*) ;; *) PANEL_URLS="$PANEL_URLS $_u" ;; esac; done
+CLIENT_ID=$(cat "$ACC_DIR/client_id" 2>/dev/null || echo "home")
+TOKEN=$(cat "$ACC_DIR/pull_token" 2>/dev/null)
+TMP="/tmp/failover.conf.pull${PHOBOS_ACC:+-$CLIENT_ID}"
+LOCK="/tmp/phobos-pull${PHOBOS_ACC:+-$CLIENT_ID}.lock"
 
 log() { echo "$(date '+%H:%M:%S') $1" >> "$LOG"; }
 
@@ -74,8 +80,21 @@ fetch_config() {
     wget -T 8 --no-check-certificate -q -O "$TMP" "$url" 2>/dev/null || wget -T 8 -q -O "$TMP" "$url" 2>/dev/null
 }
 
+# TCP channel for routers (1.5.0): the guard needs /opt/bin/udptcp when failover.conf has TCP_N.
+ensure_udptcp() {
+    [ -x /opt/bin/udptcp ] && return 0
+    grep -q "^TCP_[0-9]*=" "$CONF" 2>/dev/null || return 0
+    case "$(uname -m)" in aarch64) a=aarch64 ;; mips*) a=mipsel ;; *) return 0 ;; esac
+    command -v curl >/dev/null || return 0
+    { curl -fsSL -m 30 -o /opt/bin/udptcp.tmp "https://raw.githubusercontent.com/adleibzon-rgb/PCA_Phobos/main/udptcp/bin/udptcp-$a" 2>/dev/null \
+      || curl -fsSL -m 30 -o /opt/bin/udptcp.tmp "https://git.bobyrev.com/PCA/PCA_Phobos/raw/branch/main/udptcp/bin/udptcp-$a" 2>/dev/null; } \
+        && [ -s /opt/bin/udptcp.tmp ] && chmod 755 /opt/bin/udptcp.tmp && mv /opt/bin/udptcp.tmp /opt/bin/udptcp \
+        && log "PULL: udptcp installed ($a)" || rm -f /opt/bin/udptcp.tmp
+}
+
 # One fetch + compare + apply pass. Returns 0 always (best-effort).
 do_pull() {
+    ensure_udptcp
     # Try each source (tunnel first); accept first that returns a valid conf.
     got=0
     for base in $PANEL_URLS; do
@@ -113,7 +132,13 @@ apply_obf_params() {
     D=$(grep "^OBF_MAX_DUMMY=" "$CONF" 2>/dev/null | cut -d= -f2-)
     I=$(grep "^OBF_IDLE=" "$CONF" 2>/dev/null | cut -d= -f2-)
     changed=0
-    for OBF in "$PHOBOS_DIR"/wg-obfuscator*.conf; do
+    # только свой обфускатор: у других учёток свои failover.conf
+    own=""
+    for l in "$PHOBOS_DIR"/wg-obfuscator*.link; do
+        [ "$(cat "$l" 2>/dev/null)" = "$CLIENT_ID" ] && own="${l%.link}.conf"
+    done
+    [ -z "$own" ] && [ -z "$PHOBOS_ACC" ] && own="$PHOBOS_DIR/wg-obfuscator*.conf"
+    for OBF in $own; do
         [ -f "$OBF" ] || continue
         cur=$(grep "^masking = " "$OBF" 2>/dev/null | sed 's/masking = //')
         [ "$cur" != "$M" ] && { sed -i "s/^masking = .*/masking = $M/" "$OBF"; changed=1; }
@@ -129,7 +154,9 @@ apply_obf_params() {
     [ "$changed" = 0 ] && return 0
     log "PULL: obf params applied (masking=$M dummy=${D:-} idle=${I:-}), restart obfuscator"
     if ls /opt/etc/init.d/S*obfuscator* >/dev/null 2>&1; then
-        for sc in /opt/etc/init.d/S*obfuscator*; do [ -x "$sc" ] && "$sc" restart >/dev/null 2>&1; done
+        for sc in /opt/etc/init.d/S*obfuscator*; do
+            for OBF in $own; do grep -q "/$(basename "$OBF")\"\$" "$sc" && [ -x "$sc" ] && "$sc" restart >/dev/null 2>&1; done
+        done
     elif command -v systemctl >/dev/null 2>&1; then
         systemctl restart 'wg-obfuscator*' >/dev/null 2>&1 || true
     else

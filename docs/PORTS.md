@@ -11,6 +11,8 @@ fails", or "panel is too exposed".
 | `PANEL_PORT` | TCP | admin browser, secondary setup/register, router pull fallback | yes | Web panel and `/api/*`. Real value: `cat /opt/phobos-panel/.port`. |
 | `80` | TCP | routers during install, Android APK download | recommended | nginx serves `/init/`, `/packages/`, `/app/`. |
 | `2083,5443,993` | UDP | routers and Android PhobosWG | yes | wg-obfuscator public entry ports. Real value: `grep OBFUSCATOR_PORTS /opt/Phobos/server/server.env`. |
+| `443` (else `8443`/`2096`/`4433`) | TCP | PCA Phobos VPN apps, Windows, routers (1.5.0+) when UDP is blocked | recommended | TCP fallback `phobos-tcp` (udptcp) since 1.4.1; port chosen at install/update, shown in `phobos-update` output (`TCP fallback: port N`). |
+| second public IP: obfuscator ports + TCP | UDP/TCP | routers whose ISP blocks the main IP | optional | `phobos-altip` (1.5.0) DNATs the second IP to the main one; list it in panel → «Адрес для клиентов» → spare addresses. |
 | `51820` | UDP | plain WireGuard clients only | no by default | Usually blocked to force obfuscation. Open only if installed with `ALLOW_PLAIN_WG=1` for iOS/plain WG. |
 | `22` | TCP | admin only | optional | SSH maintenance. Do not expose broadly. |
 
