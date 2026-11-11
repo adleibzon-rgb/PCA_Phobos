@@ -108,7 +108,7 @@ PY
 [Interface]
 PrivateKey = $priv_key
 Address = $addr_str
-DNS = 1.1.1.1, 8.8.8.8
+DNS = ${CLIENT_DNS:-1.1.1.1, 8.8.8.8}
 MTU = 1420
 
 [Peer]

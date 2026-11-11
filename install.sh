@@ -68,7 +68,7 @@ PY
 # Источник: Gitea git.bobyrev.com (основной), GitHub — запасной.
 # Каналы stable/beta/dev — ветки main/beta/dev одного публичного репозитория.
 PCA_GIT="${PCA_GIT:-https://git.bobyrev.com/PCA/PCA_Phobos}"
-GH_RAW="${GH_RAW:-https://raw.githubusercontent.com/andrey271192/PCA_Phobos}"
+GH_RAW="${GH_RAW:-https://raw.githubusercontent.com/adleibzon-rgb/PCA_Phobos}"
 CHANNEL="${CHANNEL:-stable}"
 case "$CHANNEL" in
   stable|main|"") PCA_BRANCH="${PCA_BRANCH:-main}";;

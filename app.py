@@ -36,7 +36,7 @@ SECRET_FILE = f"{PANEL_DIR}/.secret_key"
 WG_CONFIG = "/etc/wireguard/wg0.conf"
 # Distribution: Gitea first (GitHub account is unavailable since 23.10.2026), GitHub fallback
 PCA_GIT = "https://git.bobyrev.com/PCA/PCA_Phobos"
-PCA_GH_RAW = "https://raw.githubusercontent.com/andrey271192/PCA_Phobos"
+PCA_GH_RAW = "https://raw.githubusercontent.com/adleibzon-rgb/PCA_Phobos"
 APK_TAG = "v1.4.4"
 WARP_DIR = f"{PHOBOS_DIR}/server/warp"
 WARP_CUSTOM_PROFILE_FILE = f"{WARP_DIR}/custom-profile.conf"
@@ -1071,15 +1071,15 @@ UPDATE_BIN = "/usr/local/bin/phobos-update"
 def _update_repo_for_ref(ref):
     ref = (ref or "").strip()
     if ref in ("beta", "dev"):
-        return "andrey271192/PCA_Phobos-dev", ref
+        return "adleibzon-rgb/PCA_Phobos-dev", ref
     if ref in ("stable", "main", "") or ref.startswith("v"):
-        return "andrey271192/PCA_Phobos", "main" if ref in ("stable", "") else ref
+        return "adleibzon-rgb/PCA_Phobos", "main" if ref in ("stable", "") else ref
     version = panel_version()
     if "beta" in version:
-        return "andrey271192/PCA_Phobos-dev", "beta"
+        return "adleibzon-rgb/PCA_Phobos-dev", "beta"
     if "dev" in version:
-        return "andrey271192/PCA_Phobos-dev", "dev"
-    return "andrey271192/PCA_Phobos", "main"
+        return "adleibzon-rgb/PCA_Phobos-dev", "dev"
+    return "adleibzon-rgb/PCA_Phobos", "main"
 
 
 def _current_update_ref(arg):
@@ -1198,6 +1198,34 @@ def client_endpoint(ip):
 
 
 _HOST_RE = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$")
+DEFAULT_CLIENT_DNS = "1.1.1.1, 8.8.8.8"
+
+
+def client_dns():
+    return _load_server_env().get("CLIENT_DNS", "").strip() or DEFAULT_CLIENT_DNS
+
+
+def _apply_client_dns(wg):
+    """Issued .conf files keep the DNS they were born with; serve the current one."""
+    return re.sub(r"(?mi)^DNS\s*=.*$", "DNS = " + client_dns(), wg)
+
+
+def save_client_dns(form):
+    raw = (form.get("client_dns", "") or "").replace(";", ",")
+    items = [x.strip() for x in raw.split(",") if x.strip()]
+    for x in items:
+        try:
+            ipaddress.ip_address(x)
+        except ValueError:
+            return False, tr("Неверный DNS: ", "Bad DNS: ") + x
+    try:
+        lines = [ln for ln in open(SERVER_ENV).read().splitlines() if not ln.startswith("CLIENT_DNS=")]
+        if items and ", ".join(items) != DEFAULT_CLIENT_DNS:
+            lines.append("CLIENT_DNS=" + ",".join(items))  # no spaces: server.env is also `source`d
+        Path(SERVER_ENV).write_text("\n".join(lines) + "\n")
+    except Exception as e:
+        return False, f"server.env: {e}"
+    return True, "DNS = " + client_dns()
 
 
 def save_client_endpoints(form):
@@ -1249,6 +1277,93 @@ def run_speedtest(ip):
     s.setdefault("speedtests", {})[ip or SERVER_IP] = res
     save_settings(s)
     return res
+
+
+
+# --- Google geo (09.30): how Google sees the server's addresses ---------------
+GOOGLE_CLOSED = {"Russia", "Belarus", "China", "Iran", "Hong Kong", "North Korea", "Cuba", "Syria"}
+
+
+def _google_country(*args):
+    """«Country version» at the bottom of policies.google.com/terms = the country Google assigns to the address."""
+    import re as _re
+    import subprocess as _sp
+    try:
+        html = _sp.run(["curl", *args, "-s", "-m", "15", "https://policies.google.com/terms?hl=en"],
+                       capture_output=True, text=True, timeout=25).stdout
+        m = _re.search(r"Country version:\s*</a>\s*([A-Za-z][A-Za-z .'-]*?)\s*<", html)
+        return m.group(1) if m else None
+    except Exception:
+        return None
+
+
+def google_geo():
+    """v4/v6 = default route (what clients exit with); ips = every public IPv4 on the server."""
+    import re as _re
+    import subprocess as _sp
+    import time as _t
+    out = {"v4": _google_country("-4"), "v6": _google_country("-6"), "ips": {}, "ts": int(_t.time())}
+    try:
+        for line in _sp.run(["ip", "-4", "-o", "addr", "show", "scope", "global"], capture_output=True,
+                            text=True, timeout=10).stdout.splitlines():
+            ip = line.split()[3].split("/")[0]
+            if not _re.match(r"^(10|127|172\.(1[6-9]|2\d|3[01])|192\.168|100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7]))\.", ip):
+                out["ips"][ip] = _google_country("-4", "--interface", ip)
+    except Exception:
+        pass
+    return out
+
+
+_google_geo_busy = set()
+
+
+def refresh_google_geo(ip):
+    """Background refresh of google_geo for one server (main: locally, secondary: mini-API)."""
+    if ip in _google_geo_busy:
+        return
+    _google_geo_busy.add(ip)
+
+    def _run():
+        try:
+            if not ip or ip == SERVER_IP:
+                res = google_geo()
+            else:
+                srv = next((x for x in load_servers() if x.get("ip") == ip), None)
+                res = secondary_api_request(srv, "/api/google-geo", None, timeout=120) if srv else None
+            if res and "v4" in res:
+                s = load_settings()
+                s.setdefault("google_geo", {})[ip or SERVER_IP] = res
+                save_settings(s)
+        except Exception:
+            pass
+        finally:
+            _google_geo_busy.discard(ip)
+    import threading as _th
+    _th.Thread(target=_run, daemon=True).start()
+
+
+def google_geo_html(ip):
+    """Card lines: «Google видит: IPv4 X · IPv6 Y» (+ other IPv4), red + warning if Google marks it closed."""
+    import time as _t
+    g = load_settings().get("google_geo", {}).get(ip) or {}
+    if not g or _t.time() - g.get("ts", 0) > 3 * 3600:
+        refresh_google_geo(ip)
+    if not g:
+        return f'{tr("Google видит", "Google sees")}: <span>{tr("проверяется…", "checking…")}</span>'
+    def b(v):
+        col = "#e66" if v in GOOGLE_CLOSED else "var(--text)"
+        return f'<b style="color:{col}">{v or "—"}</b>'
+    others = " · ".join(f'{k} {b(v)}' for k, v in sorted((g.get("ips") or {}).items()) if k != ip)
+    ago = int((_t.time() - g.get("ts", 0)) / 60)
+    html = (f'{tr("Google видит", "Google sees")}: IPv4 {b(g.get("v4"))} · IPv6 {b(g.get("v6"))} '
+            f'<span style="opacity:.7">({ago} {tr("мин назад", "min ago")})</span>')
+    if others:
+        html += f'<br><span style="opacity:.8">{tr("другие IPv4", "other IPv4")}: {others}</span>'
+    bad = [v for v in (g.get("v4"), g.get("v6")) if v in GOOGLE_CLOSED]
+    if bad:
+        html += (f'<br><span style="color:#e66">{tr("Google считает адрес", "Google treats the address as")} «{", ".join(bad)}» — '
+                 f'{tr("Gemini и часть сервисов Google у клиентов не откроются", "Gemini and some Google services will not open for clients")}</span>')
+    return html
 
 
 LIMITS_FILE = f"{PHOBOS_DIR}/server/limits.conf"
@@ -1402,7 +1517,7 @@ def build_phone_config(cid, mode="android"):
     instpath = os.path.join(cdir, "wg-obfuscator.conf")
     if not os.path.exists(wgpath):
         return None, None
-    wg = open(wgpath).read().rstrip()
+    wg = _apply_client_dns(open(wgpath).read().rstrip())
     if mode == "ios":
         server_ip = SERVER_IP
         try:
@@ -1436,7 +1551,8 @@ def build_phone_config(cid, mode="android"):
             inst += "\n# pca-tcp = " + tcp_port
     conf = wg + "\n\n" + inst + "\n"
     payload = _prepare_phoboswg_payload(conf)
-    b64 = base64.urlsafe_b64encode(payload.encode()).decode()
+    # spec 2.1: base64url WITHOUT padding (HydraRoute rejects a trailing "=")
+    b64 = base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
     link = "phobos://" + b64 + "#" + urllib.parse.quote(cid or "none")
     return payload, link
 
@@ -1916,7 +2032,7 @@ textarea::placeholder{color:var(--muted)}
 </div>
 CONTENT
 <div class="footer">
-<b style="color:var(--accent)">PCA Phobos Panel</b> — панель управления &copy; <a href="https://git.bobyrev.com/PCA/PCA_Phobos" target="_blank" rel="noopener">andrey271192</a><br>
+<b style="color:var(--accent)">PCA Phobos Panel</b> — панель управления &copy; <a href="https://git.bobyrev.com/PCA/PCA_Phobos" target="_blank" rel="noopener">adleibzon-rgb</a><br>
 Поддержать проект: <a href="https://boosty.to/andrey27/donate" target="_blank" rel="noopener">💖 Boosty</a> · <a href="https://finance.ozon.ru/apps/sbp/ozonbankpay/019dc200-2a5d-7931-a619-782d285f6798" target="_blank" rel="noopener">💳 Ozon Bank</a> · <a href="https://t.me/PCAdministration" target="_blank" rel="noopener">✉️ Telegram</a>
 <div style="margin-top:8px;font-size:.88em;color:var(--muted);line-height:1.7;text-align:left;max-width:660px;margin:8px auto 0">
 <b>Создано на основе открытых проектов:</b><br>
@@ -1931,8 +2047,141 @@ function showHelp(el){var b=el.nextElementSibling; if(b&&b.classList.contains('h
 </body></html>"""
 
 
+# ── «Доступна новая версия»: проверка канала раз в час + баннер с описанием ──
+_upd_cache = {"ts": 0, "info": None, "busy": False}
+
+
+def _channel_of(version):
+    v = (version or "").lower()
+    return "dev" if "dev" in v else ("beta" if "beta" in v else "stable")
+
+
+def _ver_key(v):
+    """1.4.10 > 1.4.9; 1.5.0-beta.2 > 1.5.0-beta.1; release > pre-release of the same number."""
+    v = (v or "").strip().lstrip("v")
+    base, _, pre = v.partition("-")
+    nums = [int(x) if x.isdigit() else 0 for x in base.split(".")[:3]]
+    nums += [0] * (3 - len(nums))
+    pre_n = [int(x) for x in re.findall(r"\d+", pre)] or [0]
+    return (nums, 0 if pre else 1, pre_n)
+
+
+def _fetch_channel_file(channel, name):
+    repo = "PCA_Phobos" if channel == "stable" else "PCA_Phobos-dev"
+    branch = {"stable": "main"}.get(channel, channel)
+    cmd = ["curl", "-fsSL", "-m", "10", f"https://git.bobyrev.com/PCA/{repo}/raw/branch/{branch}/{name}?cb={int(time.time())}"]
+    try:
+        tok = Path(GH_TOKEN_FILE).read_text().strip()
+        if tok and repo != "PCA_Phobos":
+            cmd[1:1] = ["-H", "Authorization: token " + tok]
+    except Exception:
+        pass
+    if channel == "stable":  # public: GitHub first, Gitea fallback (09.33)
+        g = subprocess.run(["curl", "-fsSL", "-m", "10", f"https://raw.githubusercontent.com/adleibzon-rgb/PCA_Phobos/main/{name}?cb={int(time.time())}"],
+                           capture_output=True, text=True, timeout=15)
+        if g.returncode == 0 and g.stdout:
+            return g.stdout
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+    return r.stdout if r.returncode == 0 else ""
+
+
+def _changelog_since(text, cur):
+    """Sections '## X.Y.Z …' of CHANGELOG newer than the installed version."""
+    out, take = [], False
+    for ln in text.split("\n"):
+        m = re.match(r"^## +v?(\d+\.\d+\.\d+\S*)", ln)
+        if m:
+            take = _ver_key(m.group(1)) > _ver_key(cur)
+        elif ln.startswith("## "):
+            take = False
+        if take:
+            out.append(ln)
+    return "\n".join(out).strip()
+
+
+def _apps_parse(text):
+    out = {}
+    for ln in (text or "").splitlines():
+        if "=" in ln and not ln.lstrip().startswith("#"):
+            k, v = ln.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def _refresh_update_info():
+    try:
+        cur = panel_version()
+        ch = _channel_of(cur)
+        latest = _fetch_channel_file(ch, "VERSION").strip()
+        info = None
+        try:
+            local_apps = _apps_parse(open(os.path.join(PANEL_DIR, "APPS")).read())
+        except Exception:
+            local_apps = {}
+        remote_apps = _apps_parse(_fetch_channel_file(ch, "APPS"))
+        apps = [(k, local_apps.get(k, ""), v) for k, v in remote_apps.items()
+                if not local_apps.get(k) or _ver_key(v) > _ver_key(local_apps.get(k))]
+        newer = bool(latest and re.match(r"^v?\d+\.\d+", latest) and _ver_key(latest) > _ver_key(cur))
+        if newer or apps:
+            info = {"channel": ch, "cur": cur, "latest": latest if newer else cur, "apps": apps,
+                    "notes": _changelog_since(_fetch_channel_file(ch, "CHANGELOG.md"), cur)[:6000] if newer else ""}
+        _upd_cache["info"] = info
+    except Exception:
+        pass
+    finally:
+        _upd_cache["ts"] = time.time()
+        _upd_cache["busy"] = False
+
+
+def update_info():
+    if not _upd_cache["busy"] and time.time() - _upd_cache["ts"] > 3600:
+        _upd_cache["busy"] = True
+        threading.Thread(target=_refresh_update_info, daemon=True).start()
+    return _upd_cache["info"]
+
+
+def update_banner():
+    try:
+        if not session.get("auth"):
+            return ""
+    except Exception:
+        return ""
+    i = update_info()
+    if not i:
+        return ""
+    e = html_lib.escape
+    notes = e(i["notes"] or tr("Описание изменений — в CHANGELOG.md репозитория.", "See CHANGELOG.md in the repository."))
+    apps = i.get("apps") or []
+    apps_line = (" · " + tr("новые приложения", "new apps") + ": " + ", ".join(e(f"{k} {v}") for k, _o, v in apps)) if apps else ""
+    apps_html = ("<p style=\"font-size:.88em\"><b>" + tr("Новые версии приложений", "New app versions") + ":</b><br>"
+                 + "<br>".join(e(f"{k}: {o or '—'} → {v}") for k, o, v in apps)
+                 + "<br>" + tr("После обновления панели новые ссылки на скачивание — в окне «Подключение» у клиента; разошлите их пользователям.", "After the panel update the new download links are in the client's Connection window; send them to your users.")
+                 + "</p>") if apps else ""
+    return f'''<div id="upd-bar" style="background:#16a34a;color:#fff;padding:8px 14px;text-align:center;font-size:.92em">
+  {tr("Доступна новая версия","New version available")} <b>{e(i["latest"])}</b> ({e(i["channel"])}) · {tr("у вас","you have")} {e(i["cur"])}{apps_line}
+  <button class="btn btn-sm" style="background:#fff;color:#16a34a;margin-left:10px" onclick="document.getElementById('upd-modal').style.display='flex'">{tr("Обновить","Update")}</button>
+</div>
+<div id="upd-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:9999;align-items:center;justify-content:center;padding:16px">
+ <div class="card" style="max-width:640px;width:100%;max-height:85vh;overflow:auto;margin:0">
+  <h2>{tr("Обновление до","Update to")} {e(i["latest"])} ({e(i["channel"])})</h2>
+  <p style="color:var(--muted);font-size:.88em">{tr("Что нового","What's new")}:</p>
+  <pre style="white-space:pre-wrap;font-size:.85em;background:var(--bg);padding:10px;border-radius:8px">{notes}</pre>
+  {apps_html}
+  <p style="font-size:.88em"><b>{tr("Перед обновлением","Before updating")}:</b> {tr("панель сама делает бэкап PCA-слоя; ключи WireGuard, server.env и клиенты не трогаются. Свой полный бэкап (рекомендуем):","the panel backs up the PCA layer itself; WireGuard keys, server.env and clients are not touched. Your own full backup (recommended):")}<br>
+  <code>tar czf /root/phobos-backup-$(date +%F).tgz /opt/Phobos /opt/phobos-panel</code></p>
+  <p style="font-size:.88em"><b>{tr("Если что-то сломалось","If something breaks")}:</b> {tr("Настройки → «Откатить на предыдущую» или в консоли","Settings → Rollback, or in the console")} <code>phobos-update --rollback</code>.
+  {tr("Обновлены secondary-серверы? Обновите и их той же кнопкой в их панели.","Have secondary servers? Update them the same way in their panel.")}</p>
+  <form method="post" action="/settings" style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px">
+   <input type="hidden" name="action" value="update"><input type="hidden" name="target" value="{e(i["channel"])}">
+   <button type="button" class="btn btn-sm" style="background:#475569" onclick="document.getElementById('upd-modal').style.display='none'">{tr("Отмена","Cancel")}</button>
+   <button type="submit" class="btn btn-primary">{tr("Обновить сейчас","Update now")}</button>
+  </form>
+ </div>
+</div>'''
+
+
 def render(content):
-    return PAGE.replace("CONTENT", content)
+    return PAGE.replace("CONTENT", update_banner() + content)
 
 
 @app.errorhandler(404)
@@ -2805,6 +3054,7 @@ def settings_page():
             _out = tr("WARP настройки сохранены.", "WARP settings saved.")
         elif _act == "update":
             _out = run_update(request.form.get("target", "").strip() or "main")
+            _upd_cache["ts"] = 0
         elif _act == "check":
             _out = run_update("--check")
         elif _act == "warp_enable":
@@ -2842,6 +3092,8 @@ def settings_page():
             ok, _out = run_server_script("phobos-domain.sh", "remove")
         elif _act == "endpoints_save":
             ok, _out = save_client_endpoints(request.form)
+        elif _act == "dns_save":
+            ok, _out = save_client_dns(request.form)
         else:
             ok, _out = run_server_script("phobos-guard.sh", _act.split("_", 1)[1], timeout=300)
         cls = "alert-ok" if ok else "alert-error"
@@ -2948,6 +3200,15 @@ def settings_page():
     <p style="font-size:.85em;color:var(--muted);margin:10px 0 6px">{tr("Каскад — выполни на входном VPS (чистый Debian/Ubuntu, root):","Cascade — run on the entry VPS (clean Debian/Ubuntu, root):")}</p>
     <code style="background:var(--bg);padding:8px 12px;border-radius:6px;display:block;font-size:.82em;word-break:break-all">{cascade_cmd}</code>
     <p style="font-size:.8em;color:var(--muted);margin-top:6px">{tr("Отключить: phobos-cascade disable · статус: phobos-cascade status. iOS/обычный WireGuard (порт 51820) через каскад не идёт.","Disable: phobos-cascade disable · status: phobos-cascade status. iOS/plain WireGuard (port 51820) does not go through the cascade.")}</p>
+    </div>
+
+    <div class="card">
+    <h2>{tr("DNS для клиентов","Client DNS")} {hlp("DNS-серверы в конфиге клиента (строка DNS = в [Interface]). Пусто = 1.1.1.1, 8.8.8.8. Новые клиенты получают сразу; уже выданным — заново открыть ссылку/QR. Роутеры Keenetic раздают в сеть свой DNS. Если у клиента включён firewall (🛡) — добавьте эти адреса в разрешённые.", "DNS servers in the client config (DNS = line in [Interface]). Empty = 1.1.1.1, 8.8.8.8. New clients get it at once; existing ones must reopen the link/QR. Keenetic routers hand out their own DNS to the LAN. If a client has the firewall (🛡) on, add these addresses to its allow list.")}</h2>
+    <form method="post" class="form-row">
+      <input type="hidden" name="action" value="dns_save">
+      <input name="client_dns" value="{_html_attr(client_dns())}" placeholder="1.1.1.1, 8.8.8.8" style="width:260px;padding:5px 8px">
+      <button class="btn btn-primary btn-sm" type="submit">{tr("Сохранить","Save")}</button>
+    </form>
     </div>
 
     <div class="card">
@@ -3080,6 +3341,7 @@ def settings_page():
     <tr><td>{tr("WARP+ key","WARP+ key")}</td><td>{tr("сохранён","saved") if warp_license_saved else tr("не задан","not set")}</td></tr>
     <tr><td>{tr("Custom profile","Custom profile")}</td><td>{tr("сохранён","saved") if custom_profile_saved else tr("не задан","not set")}</td></tr>
     <tr><td>{tr("Egress IPv4","Egress IPv4")}</td><td>{warp_egress or '—'}</td></tr>
+    <tr><td>Handshake</td><td>{(str(warp.get("handshake_age")) + tr(" с назад", "s ago")) if warp.get("handshake_age", -1) >= 0 else tr("нет — UDP до Cloudflare не проходит", "none — UDP to Cloudflare blocked")}</td></tr>
     </table>
     <form method="post" style="margin-top:10px">
       <input type="hidden" name="action" value="warp_save">
@@ -3465,13 +3727,12 @@ def download_apk():
 @auth_required
 def client_conf_download(cid, mode):
     m = "ios" if mode == "ios" else "android"
-    if m == "android":
-        return ("Android/PhobosWG uses phobos:// QR/link import; .conf import is only valid for iOS/plain WireGuard.", 400)
     conf, _link = build_phone_config(cid, m)
     if conf is None:
         return ("client not found", 404)
     if m == "android":
-        conf = _pad_conf_with_none(conf)
+        # raw .conf carries no "= none" placeholders (spec 2.3: padding is for the link only)
+        conf = "\n".join(ln for ln in conf.split("\n") if ln.partition("=")[2].strip().lower() != "none")
     return (conf, 200, {
         "Content-Type": "text/plain; charset=utf-8",
         "Content-Disposition": 'attachment; filename="%s-%s.conf"' % (cid, m),
@@ -3512,7 +3773,9 @@ def client_phone(cid, mode):
                       f'<p style="font-size:.8em;color:var(--muted)">{tr("Поставь любое из двух приложений и открой ссылку ниже на телефоне — профиль импортируется сам.","Install either app and open the link below on the phone — the profile imports itself.")}</p>')
         extra = (client_btn + apk_btn +
                  f'<p>{tr("phobos:// ссылка — импорт в PCA Phobos VPN или PhobosWG:", "phobos:// link — import into PCA Phobos VPN or PhobosWG:")} <a href="{link}">{tr("открыть", "open")}</a></p>'
-                 f'<textarea readonly onclick="this.select()" style="width:100%;height:90px;font-size:.75em">{link}</textarea>')
+                 f'<textarea readonly onclick="this.select()" style="width:100%;height:90px;font-size:.75em">{link}</textarea>'
+                 f'<p style="font-size:.85em"><a href="/client/{cid}/conf/android">⬇ {tr("Файл .conf — для «Импорт из файла» в PCA Phobos VPN", ".conf file — for “Import from file” in PCA Phobos VPN")}</a>. '
+                 f'{tr("Ссылка выше подходит и для HydraRoute (формат phobos:// автора Phobos).", "The link above also works in HydraRoute (upstream phobos:// format).")}</p>')
     else:
         title = tr("iPhone / iOS WireGuard (без обфускации)", "iPhone / iOS WireGuard (plain, no obfuscation)")
         extra = (f'<p><a href="https://apps.apple.com/app/wireguard/id1441195209" target="_blank" rel="noopener" class="btn btn-primary" style="background:#0ea5e9">📥 {tr("WireGuard в App Store","WireGuard on the App Store")}</a> <a href="/client/{cid}/conf/ios" class="btn" style="background:#7c3aed">⬇ {tr("Скачать .conf","Download .conf")}</a></p>'
@@ -4478,6 +4741,7 @@ def servers_page():
             Peers: <b style="color:var(--text)">{peers_val}</b> &nbsp; Assigned: <b style="color:var(--text)">{assigned}</b> &nbsp; Ports: {ports}<br>
             <span title="Канал / Channel (rx+tx)">↕ <b style="color:var(--text)">{mbps_disp}</b></span><br>
             {speed_line}
+            <br>{google_geo_html(ip)}
           </div>
           <form method="post" style="margin-top:8px" onsubmit="this.querySelector('button').textContent='⏳ ~20 s…'">
             <input type="hidden" name="action" value="speedtest"><input type="hidden" name="ip" value="{ip}">

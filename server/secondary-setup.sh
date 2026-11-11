@@ -316,7 +316,7 @@ RAW="${PCA_RAW_BASE:-https://git.bobyrev.com/PCA/PCA_Phobos/raw/branch/${PCA_BRA
 PANEL_BOOTSTRAP="${MAIN_PROTO}://${MAIN_SERVER}:${MAIN_PORT}/server/api.py"
 curl -kfsSL "$PANEL_BOOTSTRAP" -o "$PHOBOS_DIR/server/api.py" \
     || curl -fsSL "$RAW/server/api.py" -o "$PHOBOS_DIR/server/api.py" \
-    || curl -fsSL "https://raw.githubusercontent.com/andrey271192/PCA_Phobos/${PCA_BRANCH}/server/api.py" -o "$PHOBOS_DIR/server/api.py"
+    || curl -fsSL "https://raw.githubusercontent.com/adleibzon-rgb/PCA_Phobos/${PCA_BRANCH}/server/api.py" -o "$PHOBOS_DIR/server/api.py"
 [ -s "$PHOBOS_DIR/server/api.py" ] || { echo "ERROR: api.py fetch failed"; exit 1; }
 
 cat > /etc/systemd/system/phobos-api.service << EOF

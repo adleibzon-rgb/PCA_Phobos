@@ -2,7 +2,7 @@
 # ============================================================
 #  PCA Phobos — полное удаление сервера (primary / panel node)
 #
-#    bash <(curl -fsSL https://raw.githubusercontent.com/andrey271192/PCA_Phobos/main/uninstall.sh)
+#    bash <(curl -fsSL https://raw.githubusercontent.com/adleibzon-rgb/PCA_Phobos/main/uninstall.sh)
 #
 #  Останавливает и удаляет: панель, обфускатор-сервисы, WireGuard wg0,
 #  nginx-сайт, watchdog-cron, бинарники, iptables-правила, каталоги Phobos.
@@ -23,8 +23,9 @@ if [ "${PURGE:-0}" != "1" ]; then
     printf "Точно удалить ВСЁ? [yes/NO]: "
     read -r ans </dev/tty 2>/dev/null || read -r ans
     # tolerate CR from Windows/phone terminals, spaces, case, "да"
-    ans=$(printf '%s' "$ans" | tr -d '\r[:space:]' | tr '[:upper:]' '[:lower:]')
-    case "$ans" in yes|y|да|д) ;; *) echo "Отменено (нужно ввести yes)."; exit 0 ;; esac
+    # no tr: in C locale it mangles Cyrillic bytes
+    ans=${ans//$'\r'/}; ans=${ans//[[:space:]]/}
+    case "$ans" in yes|Yes|YES|y|Y|да|Да|ДА|д|Д) ;; *) echo "Отменено (нужно ввести yes)."; exit 0 ;; esac
 fi
 
 IFACE=$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1)}' | head -1)

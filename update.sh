@@ -19,7 +19,7 @@ set -e
 PHOBOS_DIR=/opt/Phobos
 PANEL_DIR=/opt/phobos-panel
 PCA_GIT="${PCA_GIT:-https://git.bobyrev.com/PCA/PCA_Phobos}"
-GH_RAW="${GH_RAW:-https://raw.githubusercontent.com/andrey271192/PCA_Phobos}"
+GH_RAW="${GH_RAW:-https://raw.githubusercontent.com/adleibzon-rgb/PCA_Phobos}"
 BACKUPS="$PHOBOS_DIR/updates"
 VERFILE="$PANEL_DIR/.version"
 CUR=$(cat "$VERFILE" 2>/dev/null || echo "unknown")
@@ -53,8 +53,9 @@ fetch_repo_file() {  # $1=ref $2=repo_path $3=output ; Gitea first, GitHub fallb
             curl -fsSL -m25 -H "Authorization: token $GH_TOKEN" "$PCA_GIT_DEV/raw/branch/$ref/$rp?cb=$(date +%s)" -o "$out" 2>/dev/null && return 0
         fi;;
     esac
-    curl -fsSL -m25 "$PCA_GIT/raw/$kind/$ref/$rp?cb=$(date +%s)" -o "$out" 2>/dev/null && return 0
-    curl -fsSL -m25 "$GH_RAW/$ref/$rp?cb=$(date +%s)" -o "$out"
+    # GitHub first (Gitea sits on one home IP and is cut for some providers, 09.33), Gitea fallback
+    curl -fsSL -m25 "$GH_RAW/$ref/$rp?cb=$(date +%s)" -o "$out" 2>/dev/null && return 0
+    curl -fsSL -m25 "$PCA_GIT/raw/$kind/$ref/$rp?cb=$(date +%s)" -o "$out"
 }
 
 fetch_repo_text() {  # $1=ref $2=repo_path
@@ -69,6 +70,7 @@ fetch_repo_text() {  # $1=ref $2=repo_path
 managed_files() {
 cat <<LIST
 $PANEL_DIR/app.py|app.py
+$PANEL_DIR/APPS|APPS
 $PHOBOS_DIR/repo/server/scripts/lib-core.sh|overlay/lib-core.sh
 $PHOBOS_DIR/repo/server/scripts/phobos-client.sh|overlay/phobos-client.sh
 $PHOBOS_DIR/repo/client/templates/install-router.sh.template|overlay/install-router.sh.template

@@ -109,6 +109,7 @@ bash <(curl -fsSL https://git.bobyrev.com/PCA/PCA_Phobos/raw/branch/main/install
 После установки панель напечатает адрес, логин, пароль и **API key** — сохрани их.
 
 Полный список портов и что можно закрывать: [docs/PORTS.md](docs/PORTS.md).
+DNS клиентов и свой AdGuard Home: [docs/DNS.md](docs/DNS.md). WARP — проверка и проблемы: [docs/WARP.md](docs/WARP.md).
 
 ### Вторичный сервер (для failover / балансировки)
 

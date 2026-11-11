@@ -194,6 +194,8 @@ post_up = (
     "sysctl -w net.ipv4.ip_forward=1 >/dev/null; "
     f"ip route replace {subnet} dev wg0 table {table}; "
     f"ip route replace default dev %i table {table}; "
+    "iptables -t mangle -C FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || "
+    "iptables -t mangle -A FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu; "
     "iptables -C FORWARD -i wg0 -o %i -j ACCEPT 2>/dev/null || iptables -I FORWARD 1 -i wg0 -o %i -j ACCEPT; "
     "iptables -C FORWARD -i %i -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || "
     "iptables -I FORWARD 1 -i %i -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT; "
@@ -203,6 +205,7 @@ post_up = (
 post_down = (
     f"ip route del {subnet} dev wg0 table {table} 2>/dev/null || true; "
     f"ip route del default dev %i table {table} 2>/dev/null || true; "
+    "iptables -t mangle -D FORWARD -o %i -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true; "
     "iptables -D FORWARD -i wg0 -o %i -j ACCEPT 2>/dev/null || true; "
     "iptables -D FORWARD -i %i -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true; "
     f"iptables -t nat -D POSTROUTING -s {subnet} -o %i -j MASQUERADE 2>/dev/null || true"
@@ -234,6 +237,7 @@ clear_egress() {
   systemctl disable --now "wg-quick@${WARP_IF}" >/dev/null 2>&1 || true
   ip route del "$(wg_subnet)" dev wg0 table "$WARP_TABLE" 2>/dev/null || true
   ip route del default dev "$WARP_IF" table "$WARP_TABLE" 2>/dev/null || true
+  iptables -t mangle -D FORWARD -o "$WARP_IF" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
   iptables -D FORWARD -i wg0 -o "$WARP_IF" -j ACCEPT 2>/dev/null || true
   iptables -D FORWARD -i "$WARP_IF" -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
   iptables -t nat -D POSTROUTING -s "$(wg_subnet)" -o "$WARP_IF" -j MASQUERADE 2>/dev/null || true
@@ -356,6 +360,35 @@ relay_enabled() {
   iptables-save 2>/dev/null | grep -q "$RELAY_TAG_PREFIX"
 }
 
+warp_handshake_age() {
+  local ts
+  ts="$(wg show "$WARP_IF" latest-handshakes 2>/dev/null | awk 'NR==1{print $2}')"
+  [ -n "$ts" ] && [ "$ts" != "0" ] && echo $(( $(date +%s) - ts )) || echo -1
+}
+
+# Cloudflare UDP to engage.cloudflareclient.com:2408 is often cut on the way:
+# try the profile endpoint first, then known WARP IP:port pairs, keep the first with a handshake.
+pick_warp_endpoint() {
+  local pub ep cur i age
+  pub="$(wg show "$WARP_IF" peers 2>/dev/null | head -1)"
+  [ -n "$pub" ] || return 0
+  cur="$(awk -F'= *' '/^Endpoint *=/{print $2; exit}' "$WARP_CONF" | tr -d ' ')"
+  for ep in "$cur" 162.159.192.1:2408 162.159.193.1:2408 162.159.192.1:500 162.159.192.1:1701 162.159.192.1:4500 162.159.195.1:2408 188.114.97.1:2408; do
+    [ -n "$ep" ] || continue
+    wg set "$WARP_IF" peer "$pub" endpoint "$ep" 2>/dev/null || continue
+    for i in 1 2 3 4 5 6; do
+      ping -c1 -W1 -I "$WARP_IF" 1.1.1.1 >/dev/null 2>&1 || true
+      age="$(warp_handshake_age)"
+      if [ "$age" -ge 0 ] && [ "$age" -lt 30 ]; then
+        [ "$ep" = "$cur" ] || sed -i "s|^Endpoint *=.*|Endpoint = ${ep}|" "$WARP_CONF"
+        echo "WARP endpoint: $ep" >&2
+        return 0
+      fi
+    done
+  done
+  echo "WARP: no handshake on any endpoint (UDP to Cloudflare blocked?)" >&2
+}
+
 enable_egress() {
   local profile_source profile_path existing_clients
   load_env
@@ -368,6 +401,7 @@ enable_egress() {
   sysctl -w net.ipv4.ip_forward=1 >/dev/null
   systemctl enable "wg-quick@${WARP_IF}" >/dev/null 2>&1 || true
   systemctl restart "wg-quick@${WARP_IF}"
+  pick_warp_endpoint
   clear_legacy_subnet_rule
   reapply_client_rules "$existing_clients"
   save_state "egress" "$profile_source" "" "" "" "$existing_clients"
@@ -436,7 +470,7 @@ client_disable() {
 status_json() {
   load_env
   load_state
-  local subnet service configured endpoint pubkey egress enabled mode profile_source relay_on
+  local subnet service configured endpoint pubkey egress enabled mode profile_source relay_on handshake=-1
   subnet="$(wg_subnet)"
   service="$(systemctl is-active "wg-quick@${WARP_IF}" 2>/dev/null || true)"
   mode="${STATE_MODE:-}"
@@ -453,6 +487,7 @@ status_json() {
     endpoint="$(awk -F'= *' '/^Endpoint *=/{print $2; exit}' "$WARP_CONF" 2>/dev/null || true)"
     pubkey="$(wg show "${WARP_IF}" public-key 2>/dev/null || true)"
     egress="$(curl -4 --interface "${WARP_IF}" -fsS --max-time 6 https://api.ipify.org 2>/dev/null || true)"
+    handshake="$(warp_handshake_age)"
     [ -n "$profile_source" ] || profile_source="$( [ -s "$CUSTOM_PROFILE" ] && echo custom || echo free )"
   fi
 
@@ -469,9 +504,9 @@ status_json() {
     enabled=true
   fi
 
-  python3 - "$enabled" "$configured" "$service" "$subnet" "$endpoint" "$pubkey" "$egress" "$mode" "$profile_source" "${STATE_RELAY_PORTS:-}" "${STATE_RELAY_TARGET:-}" "${STATE_RELAY_TARGET_IP:-}" "$( [ -s "$CUSTOM_PROFILE" ] && echo true || echo false )" "$relay_on" "$( [ -s "$LICENSE_FILE" ] && echo true || echo false )" "${STATE_CLIENTS:-}" <<'PY'
+  python3 - "$enabled" "$configured" "$service" "$subnet" "$endpoint" "$pubkey" "$egress" "$mode" "$profile_source" "${STATE_RELAY_PORTS:-}" "${STATE_RELAY_TARGET:-}" "${STATE_RELAY_TARGET_IP:-}" "$( [ -s "$CUSTOM_PROFILE" ] && echo true || echo false )" "$relay_on" "$( [ -s "$LICENSE_FILE" ] && echo true || echo false )" "${STATE_CLIENTS:-}" "$handshake" <<'PY'
 import json, sys
-enabled, configured, service, subnet, endpoint, pubkey, egress, mode, profile_source, relay_ports, relay_target, relay_target_ip, custom_saved, relay_on, license_saved, clients_csv = sys.argv[1:]
+enabled, configured, service, subnet, endpoint, pubkey, egress, mode, profile_source, relay_ports, relay_target, relay_target_ip, custom_saved, relay_on, license_saved, clients_csv, handshake = sys.argv[1:]
 if relay_on == "true" and service != "active":
     service = "relay"
 print(json.dumps({
@@ -484,6 +519,7 @@ print(json.dumps({
     "endpoint": endpoint,
     "public_key": pubkey,
     "egress_ipv4": egress,
+    "handshake_age": int(handshake),
     "relay_enabled": relay_on == "true",
     "relay_ports": relay_ports,
     "relay_target": relay_target,

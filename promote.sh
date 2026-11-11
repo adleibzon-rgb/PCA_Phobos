@@ -3,9 +3,9 @@
 #  PCA Phobos — promote / sync каналов (maintainer-инструмент)
 #
 #  Каналы и репозитории:
-#    stable -> публичный  andrey271192/PCA_Phobos        ветка main
-#    beta   -> приватный  andrey271192/PCA_Phobos-dev    ветка beta
-#    dev    -> приватный  andrey271192/PCA_Phobos-dev    ветка dev
+#    stable -> публичный  adleibzon-rgb/PCA_Phobos        ветка main
+#    beta   -> приватный  adleibzon-rgb/PCA_Phobos-dev    ветка beta
+#    dev    -> приватный  adleibzon-rgb/PCA_Phobos-dev    ветка dev
 #
 #  Поток фич — строго в одну сторону:  dev -> beta -> stable
 #  Хотфикс в stable -> forward-port в beta и dev (чтоб не потерялся).
@@ -22,8 +22,8 @@
 set -e
 GH_TOKEN="${GH_TOKEN:-}"
 [ -n "$GH_TOKEN" ] || { echo "Нужен GH_TOKEN (env)."; exit 1; }
-PUB="https://andrey271192:${GH_TOKEN}@github.com/andrey271192/PCA_Phobos.git"
-PRIV="https://andrey271192:${GH_TOKEN}@github.com/andrey271192/PCA_Phobos-dev.git"
+PUB="https://adleibzon-rgb:${GH_TOKEN}@github.com/adleibzon-rgb/PCA_Phobos.git"
+PRIV="https://adleibzon-rgb:${GH_TOKEN}@github.com/adleibzon-rgb/PCA_Phobos-dev.git"
 WORK="${PCA_WORK:-/tmp/pca-promote-work}"
 
 repo_for() { case "$1" in main) echo "$PUB";; beta|dev) echo "$PRIV";; esac; }
