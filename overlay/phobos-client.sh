@@ -306,11 +306,26 @@ PY
   printf 'http://%s:8444 %s://%s:%s %s://%s:%s\n' \
     "$panel_tunnel_ip" "$panel_scheme" "$panel_tunnel_ip" "$panel_port" \
     "$panel_scheme" "$SERVER_PUBLIC_IP_V4" "$panel_port" > "$pkg_root/panel_urls"
-  cat > "$pkg_root/failover.conf" <<FAILEOF
-# Phobos Failover Configuration
-SERVER_1=${CLIENT_ENDPOINT:-$SERVER_PUBLIC_IP_V4}:${OBFUSCATOR_PORTS:-51821,51822,51823}
-KEY_1=${OBFUSCATOR_KEY:-}
-FAILEOF
+  # second IPs (settings.json alt_endpoints): where the main IP is blocked the router
+  # must reach the tunnel and the panel through them from the very first start (09.36)
+  local pkg_alts
+  pkg_alts=$(python3 -c "import json,sys;print(' '.join(json.load(open('/opt/phobos-panel/settings.json')).get('alt_endpoints',{}).get(sys.argv[1],[])))" "$SERVER_PUBLIC_IP_V4" 2>/dev/null || true)
+  if [[ -n "$pkg_alts" ]]; then
+    local _u; _u=$(cat "$pkg_root/panel_urls")
+    for _a in $pkg_alts; do _u="$_u http://${_a}:${panel_port}"; done
+    echo "$_u" > "$pkg_root/panel_urls"
+  fi
+  {
+    echo "# Phobos Failover Configuration"
+    echo "SERVER_1=${CLIENT_ENDPOINT:-$SERVER_PUBLIC_IP_V4}:${OBFUSCATOR_PORTS:-51821,51822,51823}"
+    echo "KEY_1=${OBFUSCATOR_KEY:-}"
+    _n=1
+    for _a in $pkg_alts; do
+      _n=$((_n+1))
+      echo "SERVER_${_n}=${_a}:${OBFUSCATOR_PORTS:-51821,51822,51823}"
+      echo "KEY_${_n}=${OBFUSCATOR_KEY:-}"
+    done
+  } > "$pkg_root/failover.conf"
   
   find "$pkg_root" -type f ! -path "*/bin/*" -exec sed -i 's/\r$//' {} \;
 
@@ -396,10 +411,15 @@ action_link() {
   case "$panel_scheme" in http|https) ;; *) panel_scheme="http";; esac
   local primary_url="${panel_scheme}://${SERVER_PUBLIC_IP_V4}:${panel_port}/packages/$token/phobos-$id.tar.gz"
   local fallback_url="http://${SERVER_PUBLIC_IP_V4}:80/packages/$token/phobos-$id.tar.gz"
+  # second IPs of this server (settings.json alt_endpoints): reachable where the main IP is blocked
+  local alt_urls="" alt
+  for alt in $(python3 -c "import json,sys;print(' '.join(json.load(open('/opt/phobos-panel/settings.json')).get('alt_endpoints',{}).get(sys.argv[1],[])))" "$SERVER_PUBLIC_IP_V4" 2>/dev/null); do
+    alt_urls="$alt_urls http://${alt}:${panel_port}/packages/$token/phobos-$id.tar.gz http://${alt}:80/packages/$token/phobos-$id.tar.gz"
+  done
 
   cat > "$WWW_DIR/init/$token.sh" <<EOF
 #!/bin/sh
-urls="$primary_url $fallback_url"
+urls="${alt_urls# } $primary_url $fallback_url"
 dir="/tmp/phobos_install_\$\$"
 mkdir -p "\$dir"
 echo "Downloading..."
@@ -407,9 +427,9 @@ ok=0
   for url in \$urls; do
   rm -f "\$dir/package.tar.gz"
   if command -v curl >/dev/null; then
-    curl -k -L -s -o "\$dir/package.tar.gz" "\$url" 2>/dev/null || continue
+    curl -k -L -s --connect-timeout 10 -m 300 -o "\$dir/package.tar.gz" "\$url" 2>/dev/null || continue
   else
-    wget --no-check-certificate -q -O "\$dir/package.tar.gz" "\$url" 2>/dev/null || wget -q -O "\$dir/package.tar.gz" "\$url" 2>/dev/null || continue
+    wget -T 15 --no-check-certificate -q -O "\$dir/package.tar.gz" "\$url" 2>/dev/null || wget -T 15 -q -O "\$dir/package.tar.gz" "\$url" 2>/dev/null || continue
   fi
   if grep -qi '<html' "\$dir/package.tar.gz" 2>/dev/null; then
     echo "Bad response from \$url (HTML/proxy page), trying next..."

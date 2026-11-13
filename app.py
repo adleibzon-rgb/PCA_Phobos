@@ -4473,7 +4473,7 @@ def install_command(token, port=None):
     return ("p=/tmp/phobos-init-$$.sh; ok=0; "
             f"for u in {' '.join(urls)}; do "
             "rm -f $p; "
-            "(wget -q -O $p $u || wget --no-check-certificate -q -O $p $u || curl -kfsSL -o $p $u || curl -fsSL -o $p $u) 2>/dev/null || continue; "
+            "(wget -T 10 -q -O $p $u || wget -T 10 --no-check-certificate -q -O $p $u || curl -m 20 -kfsSL -o $p $u || curl -m 20 -fsSL -o $p $u) 2>/dev/null || continue; "
             "head -c 2 $p | grep -q \"#!\" || continue; "
             "sh $p && ok=1 && break; "
             "done; rm -f $p; [ $ok -eq 1 ] || echo ERROR_install_script_download_failed")
@@ -4483,7 +4483,7 @@ def short_install_command(token, port=None):
     port = port or panel_port()
     alts = alt_endpoints(SERVER_IP)
     host = alts[0] if alts else client_endpoint(SERVER_IP)   # prefer the IP that is reachable from RU
-    return f"wget -qO /tmp/p.sh {"http" if alts else panel_scheme()}://{host}:{port}/init/{token}.sh && sh /tmp/p.sh"
+    return f"wget -T 15 -qO /tmp/p.sh {"http" if alts else panel_scheme()}://{host}:{port}/init/{token}.sh && sh /tmp/p.sh"
 
 
 @app.route("/init/<path:name>")
