@@ -4468,6 +4468,8 @@ def install_command(token, port=None):
     urls = [f"{panel_scheme()}://{host}:{port}/init/{token}.sh", f"http://{host}/init/{token}.sh"]
     if host != SERVER_IP:
         urls += [f"{panel_scheme()}://{SERVER_IP}:{port}/init/{token}.sh", f"http://{SERVER_IP}/init/{token}.sh"]
+    for alt in alt_endpoints(SERVER_IP):   # second IP: reachable where the main one is blocked
+        urls += [f"http://{alt}:{port}/init/{token}.sh", f"http://{alt}/init/{token}.sh"]
     return ("p=/tmp/phobos-init-$$.sh; ok=0; "
             f"for u in {' '.join(urls)}; do "
             "rm -f $p; "
@@ -4475,6 +4477,13 @@ def install_command(token, port=None):
             "head -c 2 $p | grep -q \"#!\" || continue; "
             "sh $p && ok=1 && break; "
             "done; rm -f $p; [ $ok -eq 1 ] || echo ERROR_install_script_download_failed")
+
+
+def short_install_command(token, port=None):
+    port = port or panel_port()
+    alts = alt_endpoints(SERVER_IP)
+    host = alts[0] if alts else client_endpoint(SERVER_IP)   # prefer the IP that is reachable from RU
+    return f"wget -qO /tmp/p.sh {"http" if alts else panel_scheme()}://{host}:{port}/init/{token}.sh && sh /tmp/p.sh"
 
 
 @app.route("/init/<path:name>")
@@ -4932,6 +4941,7 @@ def client_router_config(cid):
         return ("client not found", 404)
     token = _latest_token_for_client(cid)
     cmd = install_command(token) if token else ""
+    scmd = short_install_command(token) if token else ""
     title = tr("Установка на роутер", "Router install")
     copy = tr("Копировать", "Copy")
     copied = tr("Скопировано", "Copied")
@@ -4940,6 +4950,11 @@ def client_router_config(cid):
     <div style="display:flex;gap:8px;align-items:flex-start">
     <code id="routerCmd" style="background:var(--bg);padding:8px 12px;border-radius:6px;display:block;font-size:.82em;white-space:nowrap;overflow-x:auto;flex:1">{cmd}</code>
     <button class="btn btn-primary btn-sm" type="button" onclick="var x=document.createElement('textarea');x.value=document.getElementById('routerCmd').textContent;document.body.appendChild(x);x.select();document.execCommand('copy');document.body.removeChild(x);this.textContent='{copied}'">📋 {copy}</button>
+    </div>
+    <p style="color:var(--muted);font-size:.85em;margin-top:12px">{tr("Короткая — если веб-терминал обрезает длинную вставку.", "Short — if a web terminal cuts long pastes.")}</p>
+    <div style="display:flex;gap:8px;align-items:flex-start">
+    <code id="routerCmdShort" style="background:var(--bg);padding:8px 12px;border-radius:6px;display:block;font-size:.82em;white-space:nowrap;overflow-x:auto;flex:1">{scmd}</code>
+    <button class="btn btn-primary btn-sm" type="button" onclick="var x=document.createElement('textarea');x.value=document.getElementById('routerCmdShort').textContent;document.body.appendChild(x);x.select();document.execCommand('copy');document.body.removeChild(x);this.textContent='{copied}'">📋 {copy}</button>
     </div>
     """ if cmd else f'<p style="color:var(--err)">{tr("Нет активной команды установки. Создай/обнови клиента, чтобы выпустить install token.", "No active install command. Create/update the client to issue an install token.")}</p>')
     html = f"""
